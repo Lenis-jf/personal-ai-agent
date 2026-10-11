@@ -1,4 +1,98 @@
+# ==========================================
+
+# Python: virtual environments
+
+# ==========================================
+
 .venv/
+.venv*/
+venv/
+env/
+
+# ==========================================
+
+# Python: generated files and caches
+
+# ==========================================
+
+**pycache**/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ==========================================
+
+# Secrets and local environment configuration
+
+# ==========================================
+
 .env
-__pycache__/
+.env.*
+!.env.example
+!.env.template
+
+# ==========================================
+
+# macOS and editor files
+
+# ==========================================
+
 .DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ==========================================
+
+# Downloaded models and model caches
+
+# ==========================================
+
+# Hugging Face default cache
+
+.cache/huggingface/
+.cache/
+
+# Other common model cache directories
+
+models/
+model_cache/
+model-cache/
+mlx_cache/
+
+# Model weight files
+
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.onnx
+
+# ==========================================
+
+# Logs and generated build artifacts
+
+# ==========================================
+
+*.log
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+
+# Local temporary files
+
+# ==========================================
+
+tmp/
+temp/
