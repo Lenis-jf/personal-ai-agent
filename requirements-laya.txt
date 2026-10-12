@@ -1,2 +1,0 @@
-# Keep Laya isolated from the existing MLX/Gemma virtual environment.
-laya==0.3.20

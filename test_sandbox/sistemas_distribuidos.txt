@@ -1,0 +1,3 @@
+Resumen de Sistemas Distribuidos:
+1. Tolerancia a Particiones: El teorema CAP establece que ante una partición de red se debe elegir entre consistencia o disponibilidad.
+2. Replicación Basada en Quórum: Requiere que la suma de nodos de lectura y escritura supere el total de nodos (R + W > N) para evitar lecturas inconsistentes.

@@ -1,0 +1,3 @@
+Tema: Sistemas Distribuidos y Concurrencia
+- La replicación pasiva requiere un nodo primario que centralice las escrituras.
+- Los algoritmos de consenso como Paxos o Raft garantizan consistencia frente a particiones de red.
