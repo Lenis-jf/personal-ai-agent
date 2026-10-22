@@ -1,4 +1,7 @@
-"""Orquestador del agente basado en mensajes multi-turno nativos (messages), herramientas SRP y logs acumulativos por sesión."""
+"""
+Orquestador del agente basado en mensajes multi-turno nativos (messages),
+soporte multimodal de visión (Gemma 4), herramientas SRP y logs acumulativos por sesión.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -27,6 +30,10 @@ SKILL_TOOL_BUNDLES: dict[str, set[str]] = {
     "coding": FILE_TOOLKIT,
 }
 
+VISION_MARKER_REGEX = re.compile(
+    r"\[(?:IMAGE_READY_FOR_VISUALIZATION|IMAGEN_LISTA_PARA_VISION):\s*([^\]]+)\]"
+)
+
 
 class Agent:
     def __init__(self, llm: LLM, decider: Decider | None = None, max_steps: int = 6) -> None:
@@ -40,11 +47,7 @@ class Agent:
         self.reset_session_logs()
 
     def reset_session_logs(self) -> None:
-        """
-        Se ejecuta ÚNICAMENTE al iniciar una sesión nueva (python src/main.py) o con el comando 'clear'.
-        Inicializa desde cero ambos archivos (session_trace.log y session_history.md).
-        Durante la sesión, ambos archivos solo reciben adiciones (append) turno tras turno.
-        """
+        """Se ejecuta ÚNICAMENTE al iniciar una sesión nueva (python src/main.py) o con el comando 'clear'."""
         self.turn_counter = 0
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,6 +90,17 @@ class Agent:
         except Exception:
             pass
 
+    @staticmethod
+    def _extract_vision_paths(tool_output: str) -> list[str]:
+        """Extrae las rutas de imagen marcadas con [IMAGE_READY_FOR_VISUALIZATION: <path>]."""
+        matches = VISION_MARKER_REGEX.findall(tool_output)
+        return [m.strip() for m in matches if m.strip()]
+
+    @staticmethod
+    def _strip_vision_markers(tool_output: str) -> str:
+        """Limpia el marcador interno al guardar en Tool Memory para turnos futuros de solo texto."""
+        return VISION_MARKER_REGEX.sub("", tool_output).replace("\n\n\n", "\n\n").strip()
+
     def append_turn_history_log(
         self,
         turn_num: int,
@@ -97,10 +111,7 @@ class Agent:
         mem_stats: dict[str, int],
         total_history_messages: int,
     ) -> None:
-        """
-        Añade (append, mode='a') el registro completo del Turno N en logs/session_history.md
-        sin borrar jamás lo registrado en los turnos previos de la misma sesión.
-        """
+        """Añade (append, mode='a') el registro completo del Turno N en logs/session_history.md."""
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%H:%M:%S")
@@ -226,9 +237,9 @@ class Agent:
         user_message: str,
     ) -> tuple[list[dict[str, str]], str, dict[str, int]]:
         """
-        Construye la lista nativa de mensajes (system / user / assistant) para el chat_template
-        de Gemma 4, calibrando la memoria en 16.000 chars para el último turno y 3.500 chars
-        para turnos anteriores (equilibrio óptimo de RAM y latencia TTFT en Apple Silicon M4 16GB).
+        Construye la lista nativa de mensajes (system / user / assistant) para Gemma 4.
+        Cada turno histórico del asistente inicia con <thought>...</thought> en español para
+        reforzar el patrón in-context y evitar que el modelo derive a [Thought] en inglés.
         """
         stats = {"full_memories": 0, "compacted_memories": 0}
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -251,7 +262,7 @@ class Agent:
                     mem_blocks: list[str] = []
                     for tm in tool_memories:
                         t_name = tm.get("tool", "tool")
-                        t_out = str(tm.get("output", "")).strip()
+                        t_out = self._strip_vision_markers(str(tm.get("output", "")).strip())
                         max_keep = 16000 if is_latest_asst else 3500
                         if len(t_out) <= max_keep:
                             mem_blocks.append(f"[Tool Memory: {t_name}]\n{t_out}\n[/Tool Memory]")
@@ -262,9 +273,19 @@ class Agent:
                             stats["compacted_memories"] += 1
 
                     mem_str = "\n".join(mem_blocks)
-                    combined_asst = f"{mem_str}\n\n{clean_chat}"
+                    combined_asst = (
+                        "<thought>Ejecuté las herramientas necesarias y registré sus resultados en la memoria de sesión.</thought>\n"
+                        f"{mem_str}\n\n{clean_chat}"
+                    )
                     messages.append({"role": "assistant", "content": combined_asst})
                     debug_lines.append(f"{mem_str}\nAssistant: {clean_chat}")
+                elif role == "assistant":
+                    combined_asst = (
+                        "<thought>Respondí a la solicitud evaluando el contexto de la sesión.</thought>\n"
+                        f"{clean_chat}"
+                    )
+                    messages.append({"role": "assistant", "content": combined_asst})
+                    debug_lines.append(f"Assistant: {clean_chat}")
                 else:
                     messages.append({"role": role, "content": clean_chat})
                     debug_lines.append(f"{role.capitalize()}: {clean_chat}")
@@ -300,8 +321,8 @@ class Agent:
     @staticmethod
     def _normalize_gemma4_tokens(text: str) -> str:
         """
-        Normaliza los delimitadores nativos de pensamiento de Gemma 4 (<|channel>thought ... <channel|>)
-        hacia <thought>...</thought> sin alterar contenido de archivos inspeccionados.
+        Normaliza tanto los delimitadores nativos de pensamiento de Gemma 4 (<|channel>thought ... <channel|>)
+        como variantes con corchetes ([Thought] ... [/Thought]) hacia <thought>...</thought>.
         """
         g4_th_open = "<|channel>" + "thought"
         g4_th_close = "<channel" + "|>"
@@ -309,14 +330,14 @@ class Agent:
         th_close = "</" + "thought>"
         empty_g4 = re.compile(rf"^\s*{re.escape(g4_th_open)}\s*{re.escape(g4_th_close)}\s*")
         cleaned = empty_g4.sub("", text)
-        return cleaned.replace(g4_th_open, th_open).replace(g4_th_close, th_close)
+        cleaned = cleaned.replace(g4_th_open, th_open).replace(g4_th_close, th_close)
+        cleaned = re.sub(r"^\s*\[[Tt]hought\]", th_open, cleaned)
+        cleaned = re.sub(r"\[/[Tt]hought\]", th_close, cleaned)
+        return cleaned
 
     @classmethod
     def _split_leading_thought(cls, raw_text: str) -> tuple[str, str]:
-        """
-        Separa únicamente el bloque <thought>...</thought> inicial (incluso si quedó truncado sin
-        etiqueta de cierre </thought>), evitando que se imprima '<thought>...' en la respuesta final.
-        """
+        """Separa únicamente el bloque <thought>...</thought> inicial."""
         text = cls._normalize_gemma4_tokens(raw_text)
         for tok in ("<" + "end_of_turn>", "<" + "start_of_turn>", "<" + "eos>", "<" + "turn|>"):
             text = text.replace(tok, "")
@@ -397,6 +418,7 @@ class Agent:
     def _generate_step(
         self,
         messages: list[dict[str, str]],
+        images: list[str] | None = None,
         on_token: Callable[[str], None] | None = None,
         on_thought_token: Callable[[str], None] | None = None,
         on_thought_done: Callable[[float], None] | None = None,
@@ -417,7 +439,7 @@ class Agent:
             mode = "DETECT"  # DETECT | THOUGHT | AFTER_THOUGHT | TOOL_JSON | ANSWER
             pending = ""
 
-            for piece in self.llm.stream(messages, max_tokens=2048):
+            for piece in self.llm.stream(messages, images=images, max_tokens=2048):
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
@@ -443,14 +465,17 @@ class Agent:
                     if stripped.startswith(th_open):
                         mode = "THOUGHT"
                         pending = stripped[len(th_open) :].lstrip("\n ")
-                    elif stripped.startswith("<") and (
-                        th_open.startswith(stripped) or ("<|channel>" + "thought").startswith(stripped)
+                    elif (stripped.startswith("<") or stripped.startswith("[")) and (
+                        th_open.startswith(stripped)
+                        or ("<|channel>" + "thought").startswith(stripped)
+                        or "[Thought]".startswith(stripped)
+                        or "[thought]".startswith(stripped)
                     ):
                         continue
                     elif stripped.startswith("{") or stripped.startswith(fence_prefix):
                         mode = "TOOL_JSON"
                         pending = ""
-                    elif len(stripped) >= 8 or "\n" in stripped:
+                    elif len(stripped) >= 10 or "\n" in stripped:
                         mode = "ANSWER"
                         streamed_answer = True
                         if on_token:
@@ -470,19 +495,24 @@ class Agent:
                         mode = "AFTER_THOUGHT"
                         pending = after_close.lstrip("`")
                     else:
-                        lt_pos = pending.find("<")
-                        if lt_pos == -1:
+                        # Retener si hay un posible inicio de etiqueta de cierre </thought> o [/Thought]
+                        tag_pos = pending.find("<")
+                        bracket_pos = pending.find("[/")
+                        candidates = [p for p in (tag_pos, bracket_pos) if p != -1]
+                        cut_pos = min(candidates) if candidates else -1
+
+                        if cut_pos == -1:
                             if pending:
                                 captured_thought.append(pending)
                                 if on_thought_token:
                                     on_thought_token(pending.replace("\r", "\n"))
                             pending = ""
-                        elif lt_pos > 0:
-                            to_emit = pending[:lt_pos]
+                        elif cut_pos > 0:
+                            to_emit = pending[:cut_pos]
                             captured_thought.append(to_emit)
                             if on_thought_token:
                                 on_thought_token(to_emit.replace("\r", "\n"))
-                            pending = pending[lt_pos:]
+                            pending = pending[cut_pos:]
                         elif len(pending) > len(th_close):
                             captured_thought.append(pending)
                             if on_thought_token:
@@ -556,7 +586,7 @@ class Agent:
                 "llm_diagnostics": dict(getattr(self.llm, "last_diagnostics", {})),
             }
 
-        full_text = self.llm.generate(messages)
+        full_text = self.llm.generate(messages, images=images)
         t_end = time.perf_counter()
         return {
             "text": full_text,
@@ -574,7 +604,11 @@ class Agent:
         last_tool: str | None,
         last_args: dict[str, Any] | None,
         skill: str,
+        has_active_vision: bool = False,
     ) -> str:
+        if has_active_vision:
+            fp = Path(str((last_args or {}).get("filepath", "imagen"))).name
+            return f"Analizando visualmente los píxeles y metadatos de «{fp}» con Gemma 4 Vision..."
         if step == 1:
             if skill == "file_management":
                 return "Evaluando historial y qué archivos o directorios inspeccionar..."
@@ -610,7 +644,7 @@ class Agent:
         if action_name == "file_read":
             fp = args.get("filepath", "")
             name = Path(str(fp)).name or fp
-            return f"Leyendo contenido del archivo «{name}»..."
+            return f"Leyendo e inspeccionando «{name}»..."
         if action_name == "file_grep":
             q = args.get("query", "")
             ext = args.get("file_extension", "")
@@ -632,6 +666,10 @@ class Agent:
             entries = len([l for l in result.splitlines() if "📄" in l or "📁" in l])
             return f"✓ Árbol de directorio listado ({entries} entradas visibles)"
         if action_name == "file_read":
+            vision_paths = self._extract_vision_paths(result)
+            if vision_paths:
+                img_name = Path(vision_paths[0]).name
+                return f"🖼️ Imagen «{img_name}» + metadatos cargados en pipeline de Visión Artificial"
             chars = len(result)
             pages = len(re.findall(r"--- Página \d+", result))
             page_info = f"{pages} pág., " if pages else ""
@@ -663,6 +701,7 @@ class Agent:
             f"{'-' * 88}\n"
             f"1. STRUCTURED MESSAGES SENT TO _format_input ({len(messages)} messages):\n{msg_summary}\n\n"
             f"2. TEMPLATE METHOD: {diag.get('template_method', 'unknown')}\n"
+            f"   ACTIVE VISION IMAGES: count={diag.get('images_count', 0)} | sizes={diag.get('images_dimensions', [])}\n"
             f"3. EXACT FORMATTED PROMPT (LAST 2000 CHARS):\n"
             f"----------------------------------------\n"
             f"{formatted_prompt[-2000:]}\n"
@@ -751,6 +790,7 @@ class Agent:
 
         executed_tools_trace: list[dict[str, Any]] = []
         executed_signatures: set[str] = set()
+        active_step_images: list[str] = []
         final_response = ""
         was_streamed_to_terminal = False
 
@@ -765,11 +805,18 @@ class Agent:
 
         for step in range(1, self.max_steps + 1):
             if on_status:
-                activity_msg = self._describe_workflow_activity(step, last_tool_name, last_tool_args, decision.skill)
+                activity_msg = self._describe_workflow_activity(
+                    step,
+                    last_tool_name,
+                    last_tool_args,
+                    decision.skill,
+                    has_active_vision=bool(active_step_images),
+                )
                 on_status(activity_msg)
 
             step_res = self._generate_step(
                 messages,
+                images=active_step_images if active_step_images else None,
                 on_token=on_token,
                 on_thought_token=on_thought_token,
                 on_thought_done=on_thought_done,
@@ -828,17 +875,28 @@ class Agent:
 
                     t_tool_start = time.perf_counter()
                     tool_func = self.tool_registry[action_name]["function"]
-                    tool_result = tool_func(**args)
+                    tool_result = str(tool_func(**args))
                     t_tool_elapsed = time.perf_counter() - t_tool_start
 
+                    detected_imgs = self._extract_vision_paths(tool_result)
+                    if detected_imgs:
+                        active_step_images = detected_imgs[-2:]
+                    else:
+                        active_step_images = []
+
                     if on_event:
-                        summary_badge = self._summarize_tool_result(action_name, str(tool_result))
+                        summary_badge = self._summarize_tool_result(action_name, tool_result)
                         on_event("tool", f"[{action_name}] {summary_badge} ({t_tool_elapsed:.2f}s)")
 
                     last_tool_name = action_name
                     last_tool_args = args
 
-                    executed_tools_trace.append({"tool": action_name, "args": args, "output": tool_result})
+                    clean_result_for_trace = self._strip_vision_markers(tool_result)
+                    executed_tools_trace.append({
+                        "tool": action_name,
+                        "args": args,
+                        "output": clean_result_for_trace,
+                    })
                     profiling["steps"].append({
                         "step": step,
                         "type": "tool_call",
@@ -853,7 +911,8 @@ class Agent:
 
                     self._append_trace_log(
                         f"[TURN {turn_num} | STEP {step}] TOOL EXECUTED: {action_name}({json.dumps(args, ensure_ascii=False)}) "
-                        f"in {t_tool_elapsed:.3f}s\nTOOL OUTPUT ({len(str(tool_result))} chars):\n"
+                        f"in {t_tool_elapsed:.3f}s | vision_images={active_step_images}\n"
+                        f"TOOL OUTPUT ({len(tool_result)} chars):\n"
                         f"----------------------------------------\n{tool_result}\n----------------------------------------"
                     )
 
@@ -861,10 +920,11 @@ class Agent:
                     messages.append({
                         "role": "user",
                         "content": (
-                            f'<tool_output tool="{action_name}">\n{tool_result}\n</tool_output>\n\n'
-                            "Review the <tool_output> above. Choose ONLY ONE option:\n"
-                            "- Option A (Need another tool): Start with <thought>...</thought> (never use backticks) "
-                            "followed on the next line by ONLY the raw JSON tool call.\n"
+                            f'<tool_output tool="{action_name}">\n{clean_result_for_trace}\n</tool_output>\n\n'
+                            "Review the <tool_output> above (and the attached image in your visual input if present). "
+                            "Choose ONLY ONE option:\n"
+                            "- Option A (Need another tool, e.g. to inspect another candidate file/image): Start with <thought>...</thought> "
+                            "(never use backticks) followed on the next line by ONLY the raw JSON tool call.\n"
                             "- Option B (Have all required data): Start with <thought>...</thought> (never use backticks) "
                             "followed by your complete final answer in natural language, and STOP immediately without any JSON."
                             f"{request_reminder}"
@@ -924,6 +984,7 @@ class Agent:
             })
             fb_res = self._generate_step(
                 messages,
+                images=active_step_images if active_step_images else None,
                 on_token=on_token,
                 on_thought_token=on_thought_token,
                 on_thought_done=on_thought_done,
@@ -943,7 +1004,7 @@ class Agent:
                 "step": len(profiling["steps"]) + 1,
                 "type": "final_answer",
                 "time_sec": fb_res["total_sec"],
-                "ttft_sec": ttft_sec,
+                "ttft_sec": fb_res["ttft_sec"],
                 "decode_sec": fb_res["decode_sec"],
                 "tokens": self._count_tokens(final_response),
                 "tps": round(self._count_tokens(final_response) / fb_res["decode_sec"], 1),

@@ -117,9 +117,10 @@ def _find_entries_by_name(
     glob_pattern = norm_pattern if has_wildcards else f"*{norm_pattern}*"
 
     mode = entry_type.lower().strip() if entry_type else "all"
-    want_dirs = mode in {"all", "dir", "directory", "folder"}
-    want_files = mode in {"all", "file", "files"}
     exts = allowed_exts or set()
+    want_dirs = mode in {"all", "dir", "directory", "folder"}
+    # Si el modelo pasa extension_filter (ej. '.png') incluso con entry_type='dir', incluir también archivos
+    want_files = (mode in {"all", "file", "files"}) or bool(exts)
 
     exact_matches: list[tuple[str, Path]] = []
     all_candidates: list[tuple[str, Path]] = []
@@ -128,7 +129,7 @@ def _find_entries_by_name(
         for root, dirs, files in os.walk(root_dir, followlinks=False):
             dirs[:] = [d for d in dirs if not (d in IGNORE_DIR_NAMES or d.startswith("."))]
 
-            if want_dirs and not exts:
+            if want_dirs:
                 for d in dirs:
                     full_d = Path(root) / d
                     all_candidates.append(("DIR", full_d))
@@ -139,6 +140,8 @@ def _find_entries_by_name(
                             return exact_matches
 
             if want_files:
+                norm_root_str = _normalize(root)
+                parent_matches = (not has_wildcards) and bool(norm_pattern) and (norm_pattern in norm_root_str)
                 for file in files:
                     if file.startswith("."):
                         continue
@@ -147,7 +150,10 @@ def _find_entries_by_name(
                         continue
                     all_candidates.append(("FILE", full_f))
                     norm_file = _normalize(file)
-                    if fnmatch.fnmatch(norm_file, glob_pattern) or (not has_wildcards and norm_pattern in norm_file):
+                    name_matches = fnmatch.fnmatch(norm_file, glob_pattern) or (
+                        not has_wildcards and norm_pattern in norm_file
+                    )
+                    if name_matches or (exts and parent_matches):
                         exact_matches.append(("FILE", full_f))
                         if len(exact_matches) >= max_results:
                             return exact_matches
@@ -216,13 +222,13 @@ def safe_dir_tree(
     dirpath: str,
     extension_filter: str = "",
     sub_dir: str = "",
-    max_depth: int = 3,
-    max_entries: int = 60,
+    max_depth: int = 5,
+    max_entries: int = 80,
 ) -> str:
     """
     Explora el árbol de un directorio usando rutas relativas limpias (sin repetir la ruta base en cada línea).
-    No oculta ningún tipo de archivo: permite filtrar por `extension_filter` o `sub_dir`, y resume carpetas
-    muy densas indicando qué tipos de archivos contienen.
+    Soporta hasta profundidad 5 por defecto y limita la vista previa por subcarpeta (10 archivos) cuando se
+    explora un proyecto raíz para evitar que una sola carpeta de íconos oculte el resto de subdirectorios.
     """
     try:
         target, multiples, auto_note = _resolve_flexible_path(dirpath, expect_dir=True)
@@ -244,7 +250,7 @@ def safe_dir_tree(
             return f"Error: '{target}' es un archivo, no un directorio. Usa `file_read` para leerlo."
 
         exts = _parse_extension_filter(extension_filter)
-        depth_limit = max(1, min(int(max_depth or 3), 5))
+        depth_limit = max(1, min(int(max_depth or 5), 6))
         filter_info = f" | Filtro: {sorted(exts)}" if exts else ""
         lines = [
             f"{auto_note}[Directorio Base: {target}{filter_info}]",
@@ -252,7 +258,9 @@ def safe_dir_tree(
         ]
 
         count = 0
-        per_folder_preview = 60 if exts else 10
+        # Si se explora la raíz de un proyecto (sin sub_dir específico), mostrar máximo 10 archivos por carpeta
+        # para que carpetas con decenas de SVGs (como public/assets/icons) nunca oculten otras subcarpetas.
+        per_folder_preview = 60 if (sub_dir and sub_dir.strip()) else 10
 
         for root, dirs, files in os.walk(target, followlinks=False):
             dirs[:] = sorted([d for d in dirs if not (d in IGNORE_DIR_NAMES or d.startswith("."))])
@@ -271,7 +279,7 @@ def safe_dir_tree(
                 visible_files.append(f)
 
             indent = "  " * depth
-            if depth > 0 and (visible_files or (not exts and dirs)):
+            if depth > 0 and (visible_files or dirs):
                 lines.append(f"{indent}📁 {rel_dir.as_posix()}/")
 
             shown_in_folder = visible_files[:per_folder_preview]
@@ -288,9 +296,10 @@ def safe_dir_tree(
             if hidden_in_folder:
                 ext_counts = Counter(Path(f).suffix.lower() or "sin_ext" for f in hidden_in_folder)
                 ext_summary = ", ".join(f"{k} ({v})" for k, v in ext_counts.most_common(4))
+                folder_label = rel_dir.as_posix() if depth > 0 else "."
                 lines.append(
-                    f"{indent}  ... (+{len(hidden_in_folder)} archivos adicionales en '{rel_dir.as_posix()}': {ext_summary} "
-                    f"— usa sub_dir=\"{rel_dir.as_posix()}\" para listarlos todos)"
+                    f"{indent}  ... (+{len(hidden_in_folder)} archivos adicionales en '{folder_label}': {ext_summary} "
+                    f"— usa sub_dir=\"{folder_label}\" para listarlos todos)"
                 )
 
         if count == 0:
@@ -325,28 +334,58 @@ def _read_docx(path: Path, max_chars: int) -> str:
 
 
 def _inspect_image(path: Path) -> str:
+    """Extrae metadatos técnicos completos e incrusta el marcador de ruta para inferencia visual."""
     with Image.open(path) as img:
         width, height = img.size
-        img_format = img.format or path.suffix.upper().replace(".", "")
+        img_format = (img.format or path.suffix.upper().replace(".", "")).upper()
+        mode = img.mode
         size_kb = path.stat().st_size / 1024
+        aspect = round(width / max(1, height), 2)
+        resolved_path = str(path.resolve())
+
         return (
-            f"[Archivo de Imagen Detectado]\n"
-            f"- Tipo: {img_format} | Dimensiones: {width}x{height} px | Tamaño: {size_kb:.1f} KB\n"
-            f"- Ruta: {path}\n"
-            f"Nota: Visión artificial no activa. Describe estos metadatos al usuario."
+            f"[Image File inspected]\n"
+            f"- Format: {img_format} | Color Space / Mode: {mode}\n"
+            f"- Dimensions: {width}x{height} px (Aspect Ratio: {aspect}:1)\n"
+            f"- File Size: {size_kb:.1f} KB\n"
+            f"- Absolute Path: {resolved_path}\n"
+            f"[IMAGE_READY_FOR_VISUALIZATION: {resolved_path}]\n"
+            f"Note: The visual data of this image are loaded in the multimodal pipeline. "
+            f"It describes its visual details as well as its technical specifications."
         )
 
 
 def _inspect_svg(path: Path) -> str:
+    """Extrae metadatos técnicos y etiquetas vectoriales de un archivo XML SVG (sin pipeline raster CV)."""
     tree = ET.parse(path)
     root = tree.getroot()
-    width = root.attrib.get("width", "desconocido")
-    height = root.attrib.get("height", "desconocido")
+    width = root.attrib.get("width", "unspecified")
+    height = root.attrib.get("height", "unspecified")
+    view_box = root.attrib.get("viewBox", "unspecified")
     size_kb = path.stat().st_size / 1024
+    resolved_path = str(path.resolve())
+
+    tag_counts: Counter[str] = Counter()
+    text_labels: list[str] = []
+    for elem in root.iter():
+        tag_name = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag_name != "svg":
+            tag_counts[tag_name] += 1
+        if tag_name in {"text", "title", "desc"} and elem.text and elem.text.strip():
+            text_labels.append(elem.text.strip())
+
+    elements_summary = ", ".join(f"{k}: {v}" for k, v in tag_counts.most_common(6)) or "none"
+    labels_line = f"- Embedded Text/Titles: {', '.join(text_labels[:5])}\n" if text_labels else ""
+
     return (
-        f"[Archivo Vectorial SVG Detectado]\n"
-        f"- Dimensiones: {width}x{height} | Tamaño: {size_kb:.1f} KB\n"
-        f"- Ruta: {path}"
+        f"[SVG Vector File Inspected]\n"
+        f"- Format: SVG (XML Vector Graphics)\n"
+        f"- Dimensions: width={width}, height={height} | viewBox={view_box}\n"
+        f"- File Size: {size_kb:.1f} KB\n"
+        f"- Vector Elements Count: {elements_summary}\n"
+        f"{labels_line}"
+        f"- Absolute Path: {resolved_path}\n"
+        f"Note: SVG files are XML vector definitions (not raster bitmaps). Use these technical metadata to answer."
     )
 
 
@@ -682,8 +721,8 @@ TOOL_METADATA: dict[str, dict[str, Any]] = {
     "file_read": {
         "function": safe_read_file,
         "description": (
-            "Reads text content from a specific file (.txt, .md, .py, .js, .json, .pdf, .docx) or inspects images/SVG. "
-            "Accepts full paths or relative paths shown in dir_tree."
+            "Reads text content from a specific file (.txt, .md, .py, .js, .json, .pdf, .docx), inspects SVG metadata, "
+            "or loads raster images (.png, .jpg, .jpeg, .webp) into the multimodal Computer Vision pipeline alongside technical metadata."
         ),
         "parameters": {
             "type": "object",

@@ -1,10 +1,15 @@
-"""Backend local MLX-VLM optimizado para Gemma 4 con tabla de tokens especiales y trazabilidad completa."""
+"""
+Backend local MLX-VLM optimizado para Gemma 4 con soporte multimodal (visión),
+tabla de tokens especiales y trazabilidad completa.
+"""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterator
 import mlx.core as mx
 from mlx_vlm import load, generate, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
+from PIL import Image
 
 from .base import LLM
 
@@ -18,6 +23,8 @@ class LocalLLMMLX(LLM):
         self.model_path = model_path
         self.model, self.processor = load(model_path)
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        # En Gemma 4 el token especial de imagen es '<|image|>' (ID 258880)
+        self.image_token = getattr(self.processor, "image_token", "<|image|>")
         self.last_diagnostics: dict[str, Any] = {}
 
     def get_special_tokens_summary(self) -> str:
@@ -43,6 +50,7 @@ class LocalLLMMLX(LLM):
             "<" + "end_of_turn>",
             "<thought>",
             "</thought>",
+            "<" + "|image|>",
         ]
         seen_ids: set[int] = set()
 
@@ -74,11 +82,41 @@ class LocalLLMMLX(LLM):
 
         return "\n".join(lines)
 
-    def _format_input(self, prompt_or_messages: str | list[dict[str, str]]) -> tuple[str, str]:
+    @staticmethod
+    def _prepare_pil_images(images: list[str | Path | Image.Image] | None) -> list[Image.Image]:
         """
-        Formatea la lista de mensajes preservando el rol 'system' inicial nativo de Gemma 4
-        y devuelve (formatted_prompt, template_method_used) para el log de diagnóstico.
+        Carga y sanitiza imágenes a formato RGB de 3 canales, evitando errores de
+        dimensiones en el codificador ViT de Metal si la imagen tiene canal alfa (RGBA).
         """
+        if not images:
+            return []
+
+        loaded_images: list[Image.Image] = []
+        for img_item in images:
+            if isinstance(img_item, (str, Path)):
+                p = Path(img_item).expanduser().resolve()
+                if p.exists() and p.is_file():
+                    try:
+                        with Image.open(p) as opened_img:
+                            loaded_images.append(opened_img.convert("RGB"))
+                    except Exception:
+                        pass
+            elif isinstance(img_item, Image.Image):
+                loaded_images.append(img_item.convert("RGB"))
+
+        return loaded_images
+
+    def _format_input(
+        self,
+        prompt_or_messages: str | list[dict[str, str]],
+        num_images: int = 0,
+    ) -> tuple[str, str]:
+        """
+        Formatea la lista de mensajes preservando el rol 'system' inicial nativo de Gemma 4,
+        inyectando los tokens <|image|> requeridos y garantizando alternancia user/assistant.
+        """
+        image_prefix = (f"{self.image_token}\n" * num_images) if num_images > 0 else ""
+
         if isinstance(prompt_or_messages, list) and hasattr(self.tokenizer, "apply_chat_template"):
             normalized: list[dict[str, str]] = []
             for msg in prompt_or_messages:
@@ -99,13 +137,29 @@ class LocalLLMMLX(LLM):
                 else:
                     normalized.append({"role": role, "content": content})
 
+            if num_images > 0:
+                has_image_token = any(
+                    self.image_token in m["content"] or "<|image|>" in m["content"] or "<image>" in m["content"]
+                    for m in normalized
+                )
+                if not has_image_token:
+                    for m in reversed(normalized):
+                        if m["role"] == "user":
+                            m["content"] = f"{image_prefix}{m['content']}"
+                            break
+
             try:
                 rendered = self.tokenizer.apply_chat_template(
                     normalized,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                return rendered, "tokenizer.apply_chat_template(system_enabled)"
+                mode_label = (
+                    f"tokenizer.apply_chat_template(system_enabled, images={num_images})"
+                    if num_images > 0
+                    else "tokenizer.apply_chat_template(system_enabled)"
+                )
+                return rendered, mode_label
             except Exception as exc_primary:
                 fallback_msgs: list[dict[str, str]] = []
                 for m in normalized:
@@ -129,7 +183,10 @@ class LocalLLMMLX(LLM):
             if isinstance(prompt_or_messages, str)
             else "\n\n".join(f"{m['role']}: {m['content']}" for m in prompt_or_messages)
         )
-        return apply_chat_template(self.processor, self.model.config, prompt_str), "mlx_vlm.apply_chat_template"
+        return (
+            apply_chat_template(self.processor, self.model.config, prompt_str, num_images=num_images),
+            "mlx_vlm.apply_chat_template",
+        )
 
     def _clear_gpu_cache(self) -> None:
         try:
@@ -159,8 +216,14 @@ class LocalLLMMLX(LLM):
                     return True
         return False
 
-    def generate(self, prompt: str | list[dict[str, str]], max_tokens: int = 2048) -> str:
-        formatted_prompt, template_method = self._format_input(prompt)
+    def generate(
+        self,
+        prompt: str | list[dict[str, str]],
+        images: list[str | Path | Image.Image] | None = None,
+        max_tokens: int = 2048,
+    ) -> str:
+        pil_images = self._prepare_pil_images(images)
+        formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
         self.last_diagnostics = {
             "template_method": template_method,
             "formatted_prompt": formatted_prompt,
@@ -170,7 +233,14 @@ class LocalLLMMLX(LLM):
             "buffered_tokens_sample": [],
             "raw_with_special_tokens": "",
             "token_id_trace": [],
+            "images_count": len(pil_images),
+            "images_dimensions": [f"{im.width}x{im.height}" for im in pil_images],
         }
+
+        extra_kwargs: dict[str, Any] = {}
+        if pil_images:
+            extra_kwargs["image"] = pil_images if len(pil_images) > 1 else pil_images[0]
+
         try:
             result = generate(
                 model=self.model,
@@ -178,6 +248,7 @@ class LocalLLMMLX(LLM):
                 prompt=formatted_prompt,
                 max_tokens=max_tokens,
                 temperature=0.0,
+                **extra_kwargs,
             )
             text = result.text if hasattr(result, "text") else str(result)
             self.last_diagnostics["raw_with_special_tokens"] = text
@@ -189,8 +260,14 @@ class LocalLLMMLX(LLM):
         finally:
             self._clear_gpu_cache()
 
-    def stream(self, prompt: str | list[dict[str, str]], max_tokens: int = 2048) -> Iterator[str]:
-        formatted_prompt, template_method = self._format_input(prompt)
+    def stream(
+        self,
+        prompt: str | list[dict[str, str]],
+        images: list[str | Path | Image.Image] | None = None,
+        max_tokens: int = 2048,
+    ) -> Iterator[str]:
+        pil_images = self._prepare_pil_images(images)
+        formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
         pad_streak = 0
         buffered_subword_chunks = 0
         total_chunks = 0
@@ -209,7 +286,13 @@ class LocalLLMMLX(LLM):
             "buffered_tokens_sample": [],
             "raw_with_special_tokens": "",
             "token_id_trace": [],
+            "images_count": len(pil_images),
+            "images_dimensions": [f"{im.width}x{im.height}" for im in pil_images],
         }
+
+        extra_kwargs: dict[str, Any] = {}
+        if pil_images:
+            extra_kwargs["image"] = pil_images if len(pil_images) > 1 else pil_images[0]
 
         try:
             for chunk in stream_generate(
@@ -218,6 +301,7 @@ class LocalLLMMLX(LLM):
                 prompt=formatted_prompt,
                 max_tokens=max_tokens,
                 temperature=0.0,
+                **extra_kwargs,
             ):
                 total_chunks += 1
                 raw_tok = getattr(chunk, "token", None)
@@ -243,8 +327,6 @@ class LocalLLMMLX(LLM):
 
                 piece = chunk.text if hasattr(chunk, "text") else str(chunk)
 
-                # En mlx_vlm, chunk.text viene vacío ("") cuando el detokenizador agrupa sub-tokens
-                # sin espacios intermedios (ej. rutas largas o UUIDs). No debemos cortar ahí.
                 if not piece:
                     buffered_subword_chunks += 1
                     if tok_id is not None and len(buffered_tokens_sample) < 30:
@@ -271,8 +353,6 @@ class LocalLLMMLX(LLM):
                     stop_reason = f"stop_token_id:{tok_id}"
                     break
 
-            # Si el detokenizador de mlx_vlm retuvo sub-tokens finales sin espacio al cerrar el stream,
-            # comparamos con la decodificación directa de generated_token_ids y vaciamos el resto.
             if generated_token_ids and hasattr(self.tokenizer, "decode"):
                 try:
                     full_clean = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
