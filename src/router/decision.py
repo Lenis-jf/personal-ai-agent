@@ -6,7 +6,6 @@ from typing import Any
 
 from .schema import TOOL_FIELDS
 
-
 @dataclass(frozen=True)
 class RoutingDecision:
     skill: str
