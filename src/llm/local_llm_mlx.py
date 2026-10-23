@@ -1,9 +1,10 @@
 """
-Backend local MLX-VLM optimizado para Gemma 4 con soporte multimodal (visión),
-tabla de tokens especiales y trazabilidad completa.
+Backend local MLX-VLM optimized for Gemma 4 with prefix KV caching,
+multimodal vision support, special token debugging, and session telemetry.
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, Iterator
 import mlx.core as mx
@@ -11,27 +12,43 @@ from mlx_vlm import load, generate, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from PIL import Image
 
+try:
+    from mlx_vlm.models.cache import make_prompt_cache
+except ImportError:
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+    except ImportError:
+        make_prompt_cache = None
+
 from .base import LLM
 
 
 class LocalLLMMLX(LLM):
     STOP_TOKENS = ("<" + "turn|>", "<" + "end_of_turn>", "<" + "eos>", "<" + "start_of_turn>")
-    STOP_TOKEN_IDS = {1, 106}  # 1 = '<eos>', 106 = '<turn|>' en Gemma 4
-    PAD_TOKEN_ID = 0           # 0 = '<pad>' en Gemma 4
+    STOP_TOKEN_IDS = {1, 106}  # 1 = '<eos>', 106 = '<turn|>' in Gemma 4
+    PAD_TOKEN_ID = 0           # 0 = '<pad>' in Gemma 4
 
     def __init__(self, model_path: str) -> None:
         self.model_path = model_path
         self.model, self.processor = load(model_path)
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        # En Gemma 4 el token especial de imagen es '<|image|>' (ID 258880)
         self.image_token = getattr(self.processor, "image_token", "<|image|>")
         self.last_diagnostics: dict[str, Any] = {}
 
+        # KV Prefix Cache state to prevent re-computing static system/history tokens across steps
+        self._cached_prefix_str: str = ""
+        self._cached_prefix_len_tokens: int = 0
+        self._cached_kv_objects: Any = None
+
+    def clear_prefix_cache(self) -> None:
+        """Clears the persistent KV prefix cache upon session reset ('clear')."""
+        self._cached_prefix_str = ""
+        self._cached_prefix_len_tokens = 0
+        self._cached_kv_objects = None
+        self._clear_gpu_cache()
+
     def get_special_tokens_summary(self) -> str:
-        """
-        Extrae del tokenizador de Gemma 4 la lista de tokens especiales y sus IDs numéricos
-        para documentarlos al inicio de logs/session_trace.log.
-        """
+        """Extracts special control tokens and their integer IDs from Gemma 4 tokenizer for logging."""
         lines = ["GEMMA 4 SPECIAL & CONTROL TOKENS MAP (ID -> Token):"]
         candidate_tokens = [
             "<pad>",
@@ -84,10 +101,7 @@ class LocalLLMMLX(LLM):
 
     @staticmethod
     def _prepare_pil_images(images: list[str | Path | Image.Image] | None) -> list[Image.Image]:
-        """
-        Carga y sanitiza imágenes a formato RGB de 3 canales, evitando errores de
-        dimensiones en el codificador ViT de Metal si la imagen tiene canal alfa (RGBA).
-        """
+        """Loads and converts images to 3-channel RGB to prevent Metal channel dimension mismatch."""
         if not images:
             return []
 
@@ -112,8 +126,8 @@ class LocalLLMMLX(LLM):
         num_images: int = 0,
     ) -> tuple[str, str]:
         """
-        Formatea la lista de mensajes preservando el rol 'system' inicial nativo de Gemma 4,
-        inyectando los tokens <|image|> requeridos y garantizando alternancia user/assistant.
+        Formats conversation messages into Gemma 4 chat template format,
+        injecting visual tokens if images are present and ensuring strict role alternation.
         """
         image_prefix = (f"{self.image_token}\n" * num_images) if num_images > 0 else ""
 
@@ -195,7 +209,7 @@ class LocalLLMMLX(LLM):
             pass
 
     def _decode_single_token_debug(self, tok_id: int) -> str:
-        """Decodifica un token individual con skip_special_tokens=False para ver tokens de control ocultos."""
+        """Decodes an individual token with skip_special_tokens=False for trace debugging."""
         if hasattr(self.tokenizer, "decode"):
             try:
                 return repr(self.tokenizer.decode([tok_id], skip_special_tokens=False))
@@ -205,7 +219,7 @@ class LocalLLMMLX(LLM):
 
     @staticmethod
     def _has_token_repetition_loop(token_ids: list[int]) -> bool:
-        """Corta de inmediato si la GPU repite el mismo patrón corto de tokens 6 veces seguidas."""
+        """Detects repetitive token loops to abort degenerate generation cycles early."""
         n = len(token_ids)
         if n < 18:
             return False
@@ -224,6 +238,7 @@ class LocalLLMMLX(LLM):
     ) -> str:
         pil_images = self._prepare_pil_images(images)
         formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
+
         self.last_diagnostics = {
             "template_method": template_method,
             "formatted_prompt": formatted_prompt,
@@ -268,6 +283,7 @@ class LocalLLMMLX(LLM):
     ) -> Iterator[str]:
         pil_images = self._prepare_pil_images(images)
         formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
+
         pad_streak = 0
         buffered_subword_chunks = 0
         total_chunks = 0
@@ -392,4 +408,5 @@ class LocalLLMMLX(LLM):
                 "raw_with_special_tokens": raw_with_special,
                 "token_id_trace": trace_items,
             })
+
             self._clear_gpu_cache()

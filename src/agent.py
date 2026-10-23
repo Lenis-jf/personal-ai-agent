@@ -1,6 +1,6 @@
 """
-Orquestador del agente basado en mensajes multi-turno nativos (messages),
-soporte multimodal de visión (Gemma 4), herramientas SRP y logs acumulativos por sesión.
+Agent orchestrator managing native multi-turn conversations, adaptive two-stage
+Intern-Decision routing, Gemma 4 multimodal vision, and session logging.
 """
 from __future__ import annotations
 
@@ -14,12 +14,13 @@ from typing import Any, Callable
 from intern_decision_mlx import Decider
 from llm.base import LLM
 from router.decision import RoutingDecision
-from router.schema import question_schema
+from router.schema import focused_subskill_schema, question_schema
 from tools.file_tools import TOOL_METADATA
 
 ROOT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT_DIR.parent
 SKILLS_DIR = ROOT_DIR / "skills"
+MODULES_DIR = SKILLS_DIR / "modules"
 CONTEXT_DIR = ROOT_DIR / "context"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
@@ -29,6 +30,14 @@ SKILL_TOOL_BUNDLES: dict[str, set[str]] = {
     "file_management": FILE_TOOLKIT,
     "coding": FILE_TOOLKIT,
 }
+
+MODULE_ORDER = (
+    "file_locator",
+    "document_reader",
+    "code_inspector",
+    "content_grep",
+    "image_vision",
+)
 
 VISION_MARKER_REGEX = re.compile(
     r"\[(?:IMAGE_READY_FOR_VISUALIZATION|IMAGEN_LISTA_PARA_VISION):\s*([^\]]+)\]"
@@ -47,7 +56,7 @@ class Agent:
         self.reset_session_logs()
 
     def reset_session_logs(self) -> None:
-        """Se ejecuta ÚNICAMENTE al iniciar una sesión nueva (python src/main.py) o con el comando 'clear'."""
+        """Initializes blank session trace and history logs on session startup or clear command."""
         self.turn_counter = 0
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,8 +81,7 @@ class Agent:
                 f"# Session Conversation & Tool Memory History\n"
                 f"- **Session Started**: {ts}\n"
                 f"- **Model**: `{model_name}`\n"
-                f"- **Lifecycle**: Este archivo se inicializa solo al arrancar la sesión y **acumula (append)** "
-                f"cada turno secuencialmente sin borrar turnos anteriores.\n\n"
+                f"- **Lifecycle**: Initialized at session start; appends each turn sequentially.\n\n"
                 f"---\n\n"
             )
             self.history_log_path.write_text(history_header, encoding="utf-8")
@@ -81,7 +89,7 @@ class Agent:
             pass
 
     def _append_trace_log(self, block: str) -> None:
-        """Añade un bloque detallado al archivo session_trace.log con vaciado inmediato a disco."""
+        """Appends an execution trace block to session_trace.log with immediate disk flush."""
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             with self.trace_log_path.open("a", encoding="utf-8") as f:
@@ -92,13 +100,13 @@ class Agent:
 
     @staticmethod
     def _extract_vision_paths(tool_output: str) -> list[str]:
-        """Extrae las rutas de imagen marcadas con [IMAGE_READY_FOR_VISUALIZATION: <path>]."""
+        """Extracts file paths flagged by the [IMAGE_READY_FOR_VISUALIZATION: <path>] marker."""
         matches = VISION_MARKER_REGEX.findall(tool_output)
         return [m.strip() for m in matches if m.strip()]
 
     @staticmethod
     def _strip_vision_markers(tool_output: str) -> str:
-        """Limpia el marcador interno al guardar en Tool Memory para turnos futuros de solo texto."""
+        """Removes visual pipeline markers from Tool Memory before archiving in conversation history."""
         return VISION_MARKER_REGEX.sub("", tool_output).replace("\n\n\n", "\n\n").strip()
 
     def append_turn_history_log(
@@ -111,7 +119,7 @@ class Agent:
         mem_stats: dict[str, int],
         total_history_messages: int,
     ) -> None:
-        """Añade (append, mode='a') el registro completo del Turno N en logs/session_history.md."""
+        """Appends the complete record of Turn N to logs/session_history.md."""
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%H:%M:%S")
@@ -161,31 +169,97 @@ class Agent:
         except Exception:
             pass
 
-    def decide_route(self, user_message: str) -> RoutingDecision:
+    def decide_route(
+        self,
+        user_message: str,
+        history: list[dict[str, Any]] | None = None,
+    ) -> RoutingDecision:
+        """
+        Two-stage intelligent routing with Intern-Decision:
+        - Stage 1: Evaluates user_message in isolation to prevent topic drag on new topics.
+        - Stage 2 (Context-driven re-routing): Triggered if Intern-Decision identifies that
+          the request depends on earlier turns (needs_previous_context=True), if skill
+          confidence is low (<0.55), or if zero sub-modules exceeded threshold for an operational task.
+        """
         try:
-            request = {
+            stage1_req = {
                 "state": {"user": user_message},
                 "questions": question_schema("en"),
             }
-            raw_result = self.decider.predict(request)
-            decision = RoutingDecision.from_answers(raw_result["answers"])
+            raw_stage1 = self.decider.predict(stage1_req)
+            decision = RoutingDecision.from_answers(raw_stage1["answers"])
 
-            target_skill = (
-                "personal_assistant"
-                if decision.skill in {"email_assistant", "study_assistant", "research"}
-                else decision.skill
+            needs_reroute = (
+                (decision.needs_previous_context and bool(history))
+                or decision.skill_confidence < 0.55
+                or (decision.skill in {"file_management", "coding"} and not decision.sub_skills)
             )
-            filtered_tools = frozenset(t for t in decision.tools if t in self.tool_registry)
 
+            if needs_reroute:
+                recent_context_lines: list[str] = []
+                if history:
+                    for turn in history[-2:]:
+                        r_label = "Previous Assistant Response" if turn.get("role") == "assistant" else "Previous User Request"
+                        snippet = str(turn.get("content", "")).strip()[:280]
+                        t_mems = turn.get("tool_memories") or []
+                        tools_used = [tm.get("tool", "") for tm in t_mems if tm.get("tool")]
+                        tool_note = f" (Tools used: {tools_used})" if tools_used else ""
+                        if snippet:
+                            recent_context_lines.append(f"- {r_label}{tool_note}: {snippet}")
+
+                enriched_user_state = (
+                    "[Previous Turn Summary]\n" + "\n".join(recent_context_lines) + f"\n\n[Current User Request]\n{user_message}"
+                    if recent_context_lines
+                    else user_message
+                )
+
+                stage2_req = {
+                    "state": {"user": enriched_user_state},
+                    "questions": focused_subskill_schema(decision.skill),
+                }
+                raw_stage2 = self.decider.predict(stage2_req)
+                stage2_dec = RoutingDecision.from_answers(
+                    raw_stage2["answers"],
+                    sub_skill_threshold=0.40,
+                    tool_threshold=0.42,
+                    rerouted=True,
+                )
+
+                chosen_skill = stage2_dec.skill if stage2_dec.skill_confidence >= decision.skill_confidence else decision.skill
+                merged_tools = frozenset(t for t in (decision.tools | stage2_dec.tools) if t in self.tool_registry)
+                merged_subs = decision.sub_skills | stage2_dec.sub_skills
+                merged_confidences = {**decision.sub_skill_confidences, **stage2_dec.sub_skill_confidences}
+                merged_probs = {**decision.probabilities, **stage2_dec.probabilities}
+
+                return RoutingDecision(
+                    skill=chosen_skill,
+                    complexity=decision.complexity,
+                    model_route=decision.model_route,
+                    tools=merged_tools,
+                    needs_clarification=stage2_dec.needs_clarification,
+                    requires_confirmation=stage2_dec.requires_confirmation,
+                    probabilities=merged_probs,
+                    sub_skills=merged_subs,
+                    sub_skill_confidences=merged_confidences,
+                    needs_previous_context=decision.needs_previous_context,
+                    skill_confidence=max(decision.skill_confidence, stage2_dec.skill_confidence),
+                    rerouted=True,
+                )
+
+            filtered_tools = frozenset(t for t in decision.tools if t in self.tool_registry)
             return RoutingDecision(
-                skill=target_skill,
+                skill=decision.skill,
                 complexity=decision.complexity,
                 model_route=decision.model_route,
                 tools=filtered_tools,
                 needs_clarification=decision.needs_clarification,
                 requires_confirmation=decision.requires_confirmation,
                 probabilities=decision.probabilities,
-                latency_ms=decision.latency_ms,
+                sub_skills=decision.sub_skills,
+                sub_skill_confidences=decision.sub_skill_confidences,
+                needs_previous_context=decision.needs_previous_context,
+                skill_confidence=decision.skill_confidence,
+                rerouted=False,
             )
         except Exception:
             return RoutingDecision(
@@ -196,9 +270,15 @@ class Agent:
                 needs_clarification=False,
                 requires_confirmation=False,
                 probabilities={},
+                sub_skills=frozenset({"file_locator", "document_reader"}),
+                sub_skill_confidences={"file_locator": 0.50, "document_reader": 0.50},
+                needs_previous_context=False,
+                skill_confidence=0.0,
+                rerouted=False,
             )
 
     def _resolve_active_tools(self, decision: RoutingDecision) -> set[str]:
+        """Resolves the set of authorized tools enabled for the current decision."""
         active = {t for t in decision.tools if t in self.tool_registry}
         if decision.skill in SKILL_TOOL_BUNDLES:
             active.update(SKILL_TOOL_BUNDLES[decision.skill])
@@ -214,21 +294,67 @@ class Agent:
         profile_file = CONTEXT_DIR / "core_profile.md"
         return profile_file.read_text(encoding="utf-8") if profile_file.exists() else ""
 
-    def _load_single_skill(self, skill_name: str, has_file_tools: bool) -> tuple[str, str]:
-        skill_file = SKILLS_DIR / f"{skill_name}.md"
-        if skill_file.exists():
-            return skill_file.read_text(encoding="utf-8"), f"{skill_name}.md"
+    def _compose_modular_skill(
+        self,
+        decision: RoutingDecision,
+        active_tools: set[str],
+    ) -> tuple[str, str]:
+        """
+        Dynamically composes the base skill alongside the modular sub-skills selected by
+        Intern-Decision, formatting individual confidence scores for downstream LLM evaluation.
+        """
+        skill_name = decision.skill
+        base_skill_file = SKILLS_DIR / f"{skill_name}.md"
+        if not base_skill_file.exists():
+            fallback_name = "file_management" if active_tools else "personal_assistant"
+            base_skill_file = SKILLS_DIR / f"{fallback_name}.md"
+            skill_name = fallback_name
 
-        if has_file_tools and (SKILLS_DIR / "file_management.md").exists():
-            return (SKILLS_DIR / "file_management.md").read_text(encoding="utf-8"), "file_management.md"
+        loaded_labels: list[str] = []
+        sections: list[str] = []
 
-        if (SKILLS_DIR / "personal_assistant.md").exists():
-            return (SKILLS_DIR / "personal_assistant.md").read_text(encoding="utf-8"), "personal_assistant.md"
+        if base_skill_file.exists():
+            sections.append(base_skill_file.read_text(encoding="utf-8").strip())
+            loaded_labels.append(base_skill_file.name)
+        else:
+            sections.append("You are a helpful, direct, and grounded personal AI assistant for Juan Fernando.")
+            loaded_labels.append("builtin_default")
 
-        return (
-            "You are a helpful, direct, and grounded personal AI assistant for Juan Fernando.",
-            "builtin_default",
+        for mod_name in MODULE_ORDER:
+            if mod_name in decision.sub_skills:
+                mod_path = MODULES_DIR / f"{mod_name}.md"
+                if mod_path.exists():
+                    sections.append(mod_path.read_text(encoding="utf-8").strip())
+                    loaded_labels.append(f"modules/{mod_name}.md")
+
+        recommended_tools = sorted(list(decision.tools)) if decision.tools else sorted(list(active_tools))
+
+        # Format sub-skills with confidence levels for LLM transparency
+        sub_skills_bullets: list[str] = []
+        for mod in sorted(list(decision.sub_skills)):
+            conf = decision.sub_skill_confidences.get(mod)
+            if conf is not None:
+                note = " (moderate confidence - evaluate relevance autonomously)" if conf < 0.55 else ""
+                sub_skills_bullets.append(f"  - `{mod}` (confidence: {conf:.2f}){note}")
+            else:
+                sub_skills_bullets.append(f"  - `{mod}`")
+
+        sub_skills_rendered = "\n".join(sub_skills_bullets) if sub_skills_bullets else "  - (No sub-skills required for this turn)"
+
+        router_guidance = (
+            "## Router Tactical Guidance (Advisory)\n"
+            f"- **Primary Intent Classified**: `{decision.skill}` (confidence: `{decision.skill_confidence:.2f}`, "
+            f"complexity: `{decision.complexity}`, rerouted_2nd_pass: `{decision.rerouted}`)\n"
+            f"- **Router Suggested Starting Tools**: `{recommended_tools}`\n"
+            f"- **Active Sub-Skills Selected by Router**:\n{sub_skills_rendered}\n"
+            "- **Autonomy Rule**: Treat the Router's suggestions above as an advisory guide, NOT a rigid cage. "
+            "If conversation memory (`[Tool Memory]`) already contains the answer, answer directly without tools. "
+            "Conversely, if a multi-step task requires chaining another available runtime tool "
+            "(e.g., `file_search` -> `dir_tree` -> `file_read`), invoke it freely."
         )
+        sections.append(router_guidance)
+
+        return "\n\n".join(sections), " + ".join(loaded_labels)
 
     def _build_structured_conversation(
         self,
@@ -237,9 +363,8 @@ class Agent:
         user_message: str,
     ) -> tuple[list[dict[str, str]], str, dict[str, int]]:
         """
-        Construye la lista nativa de mensajes (system / user / assistant) para Gemma 4.
-        Cada turno histórico del asistente inicia con <thought>...</thought> en español para
-        reforzar el patrón in-context y evitar que el modelo derive a [Thought] en inglés.
+        Builds the native conversation messages list (system / user / assistant) for Gemma 4.
+        Prefixes historical assistant messages with a concise thought tag to enforce in-context formatting.
         """
         stats = {"full_memories": 0, "compacted_memories": 0}
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -295,6 +420,7 @@ class Agent:
         return messages, debug_history_str, stats
 
     def _format_tools_description(self, active_tool_names: set[str]) -> str:
+        """Formats active tool schemas and single-action turn rules for the system prompt."""
         active_tools = {k: v for k, v in self.tool_registry.items() if k in active_tool_names}
         if not active_tools:
             return (
@@ -320,10 +446,7 @@ class Agent:
 
     @staticmethod
     def _normalize_gemma4_tokens(text: str) -> str:
-        """
-        Normaliza tanto los delimitadores nativos de pensamiento de Gemma 4 (<|channel>thought ... <channel|>)
-        como variantes con corchetes ([Thought] ... [/Thought]) hacia <thought>...</thought>.
-        """
+        """Normalizes native Gemma 4 and bracketed thoughts into standard <thought>...</thought> tags."""
         g4_th_open = "<|channel>" + "thought"
         g4_th_close = "<channel" + "|>"
         th_open = "<" + "thought>"
@@ -337,9 +460,9 @@ class Agent:
 
     @classmethod
     def _split_leading_thought(cls, raw_text: str) -> tuple[str, str]:
-        """Separa únicamente el bloque <thought>...</thought> inicial."""
+        """Splits leading thought block from payload, handling unclosed streams gracefully."""
         text = cls._normalize_gemma4_tokens(raw_text)
-        for tok in ("<" + "end_of_turn>", "<" + "start_of_turn>", "<" + "eos>", "<" + "turn|>"):
+        for tok in ("<" + "end_of_turn>", "<" + "start_of_turn>", "<" + "eos>", "<" + "turn|>", "<|turn>model"):
             text = text.replace(tok, "")
         text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
@@ -358,8 +481,28 @@ class Agent:
         return "", text
 
     def _extract_tool_call(self, raw_text: str) -> dict[str, Any] | None:
+        """
+        Parses a tool invocation from model output, supporting both standard JSON
+        contracts ({"action": ...}) and native Gemma 4 tool calls (<|tool_call>call: name{args}).
+        """
         _, body = self._split_leading_thought(raw_text)
         cleaned = body.strip()
+
+        # Handle native Gemma 4 tool call format: <|tool_call>call: tool_name{params}
+        native_call_match = re.search(r"<\|tool_call>call:\s*([a-zA-Z0-9_]+)\s*(\{.*\})", cleaned, flags=re.DOTALL)
+        if native_call_match:
+            action_name = native_call_match.group(1).strip()
+            args_str = native_call_match.group(2).strip()
+            try:
+                args_dict = json.loads(args_str)
+                return {"action": action_name, "arguments": args_dict}
+            except Exception:
+                try:
+                    decoder = json.JSONDecoder()
+                    args_dict, _ = decoder.raw_decode(args_str)
+                    return {"action": action_name, "arguments": args_dict}
+                except Exception:
+                    pass
 
         if cleaned.startswith("`"):
             cleaned = re.sub(r"^`+(?:json)?\s*", "", cleaned)
@@ -392,8 +535,9 @@ class Agent:
             except Exception:
                 pass
         return None
-
+    
     def _extract_final_answer(self, raw_text: str) -> str:
+        """Extracts clean final text response, stripping accidental trailing tool call attempts."""
         lead_thought, body = self._split_leading_thought(raw_text)
         body = re.sub(r"^Assistant:\s*", "", body).strip()
         body = re.sub(r'\n+\s*\{\s*"action"\s*:.*$', "", body, flags=re.DOTALL).strip()
@@ -495,7 +639,6 @@ class Agent:
                         mode = "AFTER_THOUGHT"
                         pending = after_close.lstrip("`")
                     else:
-                        # Retener si hay un posible inicio de etiqueta de cierre </thought> o [/Thought]
                         tag_pos = pending.find("<")
                         bracket_pos = pending.find("[/")
                         candidates = [p for p in (tag_pos, bracket_pos) if p != -1]
@@ -701,6 +844,7 @@ class Agent:
             f"{'-' * 88}\n"
             f"1. STRUCTURED MESSAGES SENT TO _format_input ({len(messages)} messages):\n{msg_summary}\n\n"
             f"2. TEMPLATE METHOD: {diag.get('template_method', 'unknown')}\n"
+            f"   KV CACHE STATUS: {diag.get('kv_cache_status', 'n/a')}\n"
             f"   ACTIVE VISION IMAGES: count={diag.get('images_count', 0)} | sizes={diag.get('images_dimensions', [])}\n"
             f"3. EXACT FORMATTED PROMPT (LAST 2000 CHARS):\n"
             f"----------------------------------------\n"
@@ -739,21 +883,26 @@ class Agent:
         profiling: dict[str, Any] = {"steps": []}
 
         if on_status:
-            on_status("Clasificando intención con Intern-Decision...")
+            on_status("Clasificando intención y sub-skills con Intern-Decision...")
 
         t_route_start = time.perf_counter()
-        decision = self.decide_route(user_message)
+        decision = self.decide_route(user_message, history=history)
         t_route_elapsed = time.perf_counter() - t_route_start
         profiling["route_time_sec"] = t_route_elapsed
 
         active_tools = self._resolve_active_tools(decision)
-        skill_content, loaded_skill_file = self._load_single_skill(decision.skill, bool(active_tools))
-        profiling["loaded_skill"] = loaded_skill_file
+        skill_content, loaded_skill_label = self._compose_modular_skill(
+            decision=decision,
+            active_tools=active_tools,
+        )
+        profiling["loaded_skill"] = loaded_skill_label
 
         if on_event:
+            reroute_tag = " [Re-routed 2x]" if decision.rerouted else ""
             on_event(
                 "route",
-                f"Router → [{decision.skill} | {decision.complexity}] (Skill: {loaded_skill_file}) ({t_route_elapsed:.2f}s)",
+                f"Router{reroute_tag} → [{decision.skill} ({decision.skill_confidence:.2f}) | {decision.complexity}] "
+                f"({loaded_skill_label}) ({t_route_elapsed:.2f}s)",
             )
 
         base_prompt = self._load_base_prompt()
@@ -763,7 +912,7 @@ class Agent:
         system_prompt = (
             f"{base_prompt}\n\n"
             f"{core_profile}\n\n"
-            f"--- ACTIVE SKILL: {decision.skill.upper()} ({loaded_skill_file}) ---\n"
+            f"--- ACTIVE SKILL & MODULES: {decision.skill.upper()} ({loaded_skill_label}) ---\n"
             f"{skill_content}\n\n"
             f"--- RUNTIME TOOLS ---\n"
             f"{tools_prompt}"
@@ -781,8 +930,11 @@ class Agent:
             f"\n{'#' * 88}\n"
             f"TURN {turn_num} START — {datetime.now().strftime('%H:%M:%S')}\n"
             f"USER INPUT (repr): {repr(user_message)}\n"
-            f"ROUTER: skill={decision.skill} ({loaded_skill_file}) | complexity={decision.complexity} "
+            f"ROUTER: skill={decision.skill} (conf={decision.skill_confidence:.2f}, rerouted={decision.rerouted}, "
+            f"needs_prev_ctx={decision.needs_previous_context}) | sub_skills={sorted(list(decision.sub_skills))} "
+            f"| loaded=({loaded_skill_label}) | complexity={decision.complexity} "
             f"| route_time={t_route_elapsed:.2f}s | active_tools={sorted(list(active_tools))}\n"
+            f"SYSTEM PROMPT SIZE: {len(system_prompt)} chars\n"
             f"PROBABILITIES: {decision.probabilities}\n"
             f"MEMORY STATS AT TURN START: {mem_stats}\n"
             f"{'#' * 88}"
