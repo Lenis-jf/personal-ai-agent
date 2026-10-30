@@ -1,19 +1,27 @@
-"""Bucle interactivo (REPL) con historial estructurado, logs acumulativos por sesión y árbol en vivo."""
+"""Interactive REPL loop with structured history, cumulative session logs, and live workflow tree."""
 import os
 import sys
 import threading
-import select
 import termios
 import time
 from typing import Any
 from pathlib import Path
 
+# CRITICAL: Set MLX-VLM Automatic Prefix Caching (APC) environment variables BEFORE any imports
+os.environ["APC_ENABLED"] = "1"
+os.environ["APC_CHECKPOINT_ENTRIES"] = "32"
+os.environ["APC_CHECKPOINT_INTERVAL_TOKENS"] = "0"
+os.environ["APC_CHECKPOINT_GUARD_TOKENS"] = "1"
+os.environ["APC_DISK_ENABLED"] = "0"
+os.environ["APC_MEMORY_MAX_GB"] = "3.5"
+os.environ["APC_MEMORY_RESERVE_GB"] = "1.5"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent import Agent
 from llm.local_llm_mlx import LocalLLMMLX
+from agent import Agent
 
-# Estilos ANSI
+# ANSI Styles
 BOLD = "\033[1m"
 DIM = "\033[2m"
 ITALIC = "\033[3m"
@@ -26,7 +34,7 @@ RESET = "\033[0m"
 
 
 class WorkflowDisplay:
-    """Monitor de flujo en árbol con cronómetro en vivo y tiempos finales persistentes en cada rama."""
+    """Live tree workflow monitor with real-time timer and persistent branch completion badges."""
     PULSE = ["✦", "✧", "✦", "·"]
 
     def __init__(self) -> None:
@@ -85,7 +93,7 @@ class WorkflowDisplay:
     def log_event(self, kind: str, text: str) -> None:
         self.close_thought_if_open()
         self.stop_active_line()
-        icon = "🧭" if kind == "route" else "⚡"
+        icon = "🧭" if kind == "route" else ("🔄" if kind == "retry" else "⚡")
         sys.stdout.write(f"  {DIM}├─{RESET} {icon} {DIM}{text}{RESET}\n")
         sys.stdout.flush()
 
@@ -115,7 +123,7 @@ class WorkflowDisplay:
         if not self.in_answer:
             self.close_thought_if_open()
             self.stop_active_line()
-            sys.stdout.write(f"\n{GREEN}{BOLD}Asistente{RESET} > ")
+            sys.stdout.write(f"\n{GREEN}{BOLD}Assistant{RESET} > ")
             self.in_answer = True
         sys.stdout.write(token)
         sys.stdout.flush()
@@ -123,23 +131,23 @@ class WorkflowDisplay:
 
 def render_banner(debug_mode: bool) -> None:
     status_color = GREEN if debug_mode else YELLOW
-    status_text = "ACTIVADO" if debug_mode else "DESACTIVADO"
+    status_text = "ENABLED" if debug_mode else "DISABLED"
     print(f"""
 {CYAN}{BOLD}╔════════════════════════════════════════════════════════════════════════════╗
 ║                   PERSONAL AI AGENT — LOCAL macOS M4                       ║
 ╚════════════════════════════════════════════════════════════════════════════╝{RESET}
-  {DIM}• Comandos:{RESET} {BOLD}'salir'{RESET} para cerrar | {BOLD}'clear'{RESET} para memoria | {BOLD}'debug'{RESET} para telemetría
-  {DIM}• Estado Debug:{RESET} {status_color}{BOLD}[{status_text}]{RESET}
-  {DIM}• Logs de sesión:{RESET} {DIM}logs/session_trace.log | logs/session_history.md{RESET}
+  {DIM}• Commands:{RESET} {BOLD}'exit'{RESET} to quit | {BOLD}'clear'{RESET} to reset memory | {BOLD}'debug'{RESET} for telemetry
+  {DIM}• Debug Status:{RESET} {status_color}{BOLD}[{status_text}]{RESET}
+  {DIM}• Session Logs:{RESET} {DIM}logs/session_trace.log | logs/session_history.md{RESET}
 """)
 
 
 def print_debug_explanation(active: bool) -> None:
     if active:
-        print(f"\n{MAGENTA}{BOLD}>>> [MODO DEBUG: ACTIVADO] <<<{RESET}")
-        print(f"{DIM}Verás el contexto inyectado, skill cargada, tiempos de Prefill vs. Generación y salidas crudas.{RESET}\n")
+        print(f"\n{MAGENTA}{BOLD}>>> [DEBUG MODE: ENABLED] <<<{RESET}")
+        print(f"{DIM}Displaying injected context, active skill modules, Prefill/Decode timings, APC status, and raw tool outputs.{RESET}\n")
     else:
-        print(f"\n{YELLOW}{BOLD}>>> [MODO DEBUG: DESACTIVADO] <<<{RESET}\n")
+        print(f"\n{YELLOW}{BOLD}>>> [DEBUG MODE: DISABLED] <<<{RESET}\n")
 
 
 def print_profiling_card(data: dict) -> None:
@@ -150,23 +158,23 @@ def print_profiling_card(data: dict) -> None:
     loaded_skill = prof.get("loaded_skill", f"{dec.skill}.md")
     mem_stats = prof.get("memory_stats", {"full_memories": 0, "compacted_memories": 0})
 
-    print(f"\n{BLUE}┌── {BOLD}TELEMETRÍA DETALLADA DEL PIPELINE{RESET}{BLUE} ──────────────────────────────┐{RESET}")
+    print(f"\n{BLUE}┌── {BOLD}DETAILED PIPELINE TELEMETRY{RESET}{BLUE} ────────────────────────────────────┐{RESET}")
 
     injected_history = prof.get("injected_history", "").strip()
     if injected_history:
         print(
-            f"{BLUE}│{RESET} {BOLD}Contexto de sesión disponible para evaluación autónoma{RESET} "
-            f"{DIM}(Memorias completas: {mem_stats['full_memories']} | Compactadas: {mem_stats['compacted_memories']}){RESET}:"
+            f"{BLUE}│{RESET} {BOLD}Session context available for autonomous evaluation{RESET} "
+            f"{DIM}(Full memories: {mem_stats['full_memories']} | Compacted: {mem_stats['compacted_memories']}){RESET}:"
         )
         for line in injected_history.split("\n"):
             print(f"{BLUE}│{RESET}   {DIM}{line}{RESET}")
         print(f"{BLUE}│{RESET} {DIM}{'-'*60}{RESET}")
 
     print(
-        f"{BLUE}│{RESET} {BOLD}Skill activa (Router):{RESET} {CYAN}{BOLD}{dec.skill}{RESET} "
-        f"({GREEN}{loaded_skill}{RESET} | complejidad: {dec.complexity}) en {YELLOW}{prof.get('route_time_sec', 0):.2f}s{RESET}"
+        f"{BLUE}│{RESET} {BOLD}Active Skill (Router):{RESET} {CYAN}{BOLD}{dec.skill}{RESET} "
+        f"({GREEN}{loaded_skill}{RESET} | complexity: {dec.complexity}) in {YELLOW}{prof.get('route_time_sec', 0):.2f}s{RESET}"
     )
-    print(f"{BLUE}│{RESET} {BOLD}Tools activas en runtime:{RESET} {active_tools}")
+    print(f"{BLUE}│{RESET} {BOLD}Runtime Active Tools:{RESET} {active_tools}")
 
     for step in prof.get("steps", []):
         s_num = step["step"]
@@ -174,38 +182,36 @@ def print_profiling_card(data: dict) -> None:
         dec_sec = step.get("decode_sec", 0.0)
         tps = step.get("tps", 0.0)
         toks = step.get("tokens", 0)
+        kv_note = f" | {DIM}{step.get('kv_short', '')}{RESET}" if step.get("kv_short") else ""
 
         if step["type"] == "tool_call":
             print(
-                f"{BLUE}│{RESET} {BOLD}Inferencia {s_num} [Tool: {step['action']}]:{RESET} "
+                f"{BLUE}│{RESET} {BOLD}Step {s_num} [Tool: {step['action']}]:{RESET} "
                 f"Prefill: {ttft:.2f}s | Gen: {dec_sec:.2f}s ({CYAN}{tps} tok/s{RESET}, {toks} tok) | "
-                f"Tool: {GREEN}{step['tool_exec_sec']:.3f}s{RESET}"
+                f"Tool: {GREEN}{step['tool_exec_sec']:.3f}s{RESET}{kv_note}"
             )
         elif step["type"] == "circuit_breaker":
-            print(f"{BLUE}│{RESET} {BOLD}Inferencia {s_num} [Rompecircuitos]:{RESET} {YELLOW}Bucle repetido bloqueado ({step['action']}){RESET}")
+            print(f"{BLUE}│{RESET} {BOLD}Step {s_num} [Circuit Breaker]:{RESET} {YELLOW}Blocked repeated call ({step['action']}){RESET}")
         else:
             print(
-                f"{BLUE}│{RESET} {BOLD}Inferencia {s_num} [Respuesta Final]:{RESET} "
-                f"Prefill: {ttft:.2f}s | Gen: {dec_sec:.2f}s ({CYAN}{tps} tok/s{RESET}, {toks} tok)"
+                f"{BLUE}│{RESET} {BOLD}Step {s_num} [Final Answer]:{RESET} "
+                f"Prefill: {ttft:.2f}s | Gen: {dec_sec:.2f}s ({CYAN}{tps} tok/s{RESET}, {toks} tok){kv_note}"
             )
 
     if trace:
         tools_called = [t["tool"] for t in trace]
-        print(f"{BLUE}│{RESET} {BOLD}Herramientas encadenadas:{RESET} {tools_called}")
+        print(f"{BLUE}│{RESET} {BOLD}Chained Tools:{RESET} {tools_called}")
 
     total_sec = prof.get("total_time_sec", 0)
-    print(f"{BLUE}│{RESET} {BOLD}Tiempo total transcurrido:{RESET} {MAGENTA}{BOLD}{total_sec:.2f}s{RESET}")
-    print(f"{BLUE}│{RESET} {DIM}Logs actualizados (append): logs/session_trace.log | logs/session_history.md{RESET}")
+    print(f"{BLUE}│{RESET} {BOLD}Total Turn Elapsed Time:{RESET} {MAGENTA}{BOLD}{total_sec:.2f}s{RESET}")
+    print(f"{BLUE}│{RESET} {DIM}Updated logs: logs/session_trace.log | logs/session_history.md{RESET}")
     print(f"{BLUE}└───────────────────────────────────────────────────────────────────┘{RESET}")
 
 
 def read_clean_user_input(prompt_label: str) -> str:
     """
-    1. Descarta del descriptor del kernel (fd) cualquier tecla pulsada mientras el agente estaba ocupado.
-    2. Lee la primera línea con input().
-    3. Conmuta temporalmente a modo no-canónico (~ICANON) por 80ms para capturar cualquier segunda o
-       tercera línea pegada con Cmd+V (incluso si la última línea pegada aún no tiene '\\n' final),
-       y si faltaba presionar Enter en la última línea pegada, espera el Enter del usuario.
+    Flushes kernel stdin buffer before reading, captures pasted multi-line blocks in non-canonical
+    mode (~ICANON), and waits for Enter if the final pasted line lacked a trailing newline.
     """
     fd: int | None = None
     try:
@@ -223,10 +229,9 @@ def read_clean_user_input(prompt_label: str) -> str:
         try:
             old_attrs = termios.tcgetattr(fd)
             new_attrs = termios.tcgetattr(fd)
-            # Desactivar ICANON para ver bytes pegados que aún no tienen salto de línea (\n)
             new_attrs[3] = new_attrs[3] & ~termios.ICANON
             new_attrs[6][termios.VMIN] = 0
-            new_attrs[6][termios.VTIME] = 1  # 100ms timeout de lectura no bloqueante
+            new_attrs[6][termios.VTIME] = 1
             termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
 
             while True:
@@ -248,7 +253,6 @@ def read_clean_user_input(prompt_label: str) -> str:
             extra_text = extra_bytes.decode("utf-8", errors="replace")
             extra_lines = [line.rstrip("\r") for line in extra_text.splitlines()]
             if needs_enter:
-                # La última línea pegada no tenía salto de línea final; esperar a que el usuario pulse Enter
                 try:
                     tail_input = input("")
                     if extra_lines:
@@ -263,7 +267,7 @@ def read_clean_user_input(prompt_label: str) -> str:
 
 
 def main() -> None:
-    print(f"{DIM}Cargando modelos en memoria unificada de macOS...{RESET}")
+    print(f"{DIM}Loading models into macOS Unified Memory (M4)...{RESET}")
     llm = LocalLLMMLX(model_path="mlx-community/gemma-4-e4b-it-4bit")
     agent = Agent(llm=llm)
 
@@ -280,14 +284,14 @@ def main() -> None:
             if not user_input:
                 continue
 
-            if user_input.lower() in {"salir", "exit", "q"}:
-                print(f"\n{CYAN}¡Listo Juan, sesión cerrada! Nos pillamos.{RESET}")
+            if user_input.lower() in {"salir", "exit", "q", "quit"}:
+                print(f"\n{CYAN}Session closed. Catch you later, Juan!{RESET}")
                 break
 
             if user_input.lower() == "clear":
                 history.clear()
                 agent.reset_session_logs()
-                print(f"\n{YELLOW}[Memoria y logs de sesión reiniciados]{RESET}")
+                print(f"\n{YELLOW}[Session memory, APC cache, and logs reset]{RESET}")
                 continue
 
             if user_input.lower() == "debug":
@@ -313,7 +317,7 @@ def main() -> None:
             final_ans = resultado["response"].strip()
 
             if not ui.in_answer:
-                sys.stdout.write(f"\n{GREEN}{BOLD}Asistente{RESET} > {final_ans}\n")
+                sys.stdout.write(f"\n{GREEN}{BOLD}Assistant{RESET} > {final_ans}\n")
                 sys.stdout.flush()
             else:
                 sys.stdout.write("\n")
@@ -325,7 +329,7 @@ def main() -> None:
                     preview = str(trace_item["output"]).strip()
                     if len(preview) > 300:
                         preview = preview[:300] + "..."
-                    print(f"{DIM}[Salida {trace_item['tool']}]: {preview}{RESET}")
+                    print(f"{DIM}[Tool Output {trace_item['tool']}]: {preview}{RESET}")
 
             stored_memories: list[dict[str, str]] = []
             for trace in resultado["tools_trace"]:
@@ -357,7 +361,7 @@ def main() -> None:
 
         except KeyboardInterrupt:
             ui.stop_active_line()
-            print(f"\n\n{YELLOW}Sesión interrumpida. ¡Hasta luego!{RESET}")
+            print(f"\n\n{YELLOW}Session interrupted. Goodbye!{RESET}")
             break
         except Exception as err:
             ui.stop_active_line()

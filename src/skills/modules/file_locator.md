@@ -10,15 +10,15 @@
    - `dirpath` (`string`, required): Full path or project folder name to explore (e.g., `"/Users/juanfelenis/Documents/Proyectos/portfolio-2.0-vite"` or `"test_sandbox"`).
    - `extension_filter` (`string`, optional): Comma-separated extensions to filter when looking for specific file types (e.g., `".js,.json,.jsx"` for project data/code, or `".png,.jpg,.webp,.svg"` for images/assets). Omit to see all types.
    - `sub_dir` (`string`, optional): Specific subfolder inside `dirpath` to inspect in full detail (e.g., `"public/assets/imgs"`).
-   - **Expected Output**: Returns `[Directorio Base: <path>]` followed by folders (`📁`) and relative file paths (`📄`). Dense folders show a preview of 10 files plus a summary (`+N archivos adicionales — usa sub_dir="..." para listarlos todos`).
+   - **Expected Output**: Returns `[Base Directory: <path>]` followed by folders (`📁`) and relative file paths (`📄`).
 
 ### Operational Workflow & Step-by-Step Example (Exploring a Project Folder)
 - **Step 1 (Find the project directory)**:
-  <thought>El usuario busca el directorio de su portafolio web, así que buscaré carpetas con la palabra clave portfolio.</thought>
+  <thought>The user wants to explore their web portfolio directory, so I will search for folders matching the keyword portfolio.</thought>
   {"action": "file_search", "arguments": {"pattern": "portfolio", "entry_type": "dir"}}
 - **Step 2 (Explore the directory structure)**:
-  <thought>Encontré el directorio portfolio-2.0-vite; ahora usaré dir_tree filtrando por archivos de datos y código (.js, .json) para hallar el archivo maestro de proyectos.</thought>
+  <thought>I found the portfolio-2.0-vite directory; now I will use dir_tree filtering by data and code files (.js, .json) to locate the projects data file.</thought>
   {"action": "dir_tree", "arguments": {"dirpath": "/Users/juanfelenis/Documents/Proyectos/portfolio-2.0-vite", "extension_filter": ".js,.json"}}
 - **Step 3 (Read the target file discovered in the tree)**:
-  <thought>En el árbol aparece data/projectsData.js, así que lo leeré con file_read para extraer los proyectos.</thought>
+  <thought>The directory tree shows data/projectsData.js, so I will read it with file_read to extract the project details.</thought>
   {"action": "file_read", "arguments": {"filepath": "/Users/juanfelenis/Documents/Proyectos/portfolio-2.0-vite/data/projectsData.js"}}

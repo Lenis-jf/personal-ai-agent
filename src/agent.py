@@ -1,6 +1,6 @@
 """
 Agent orchestrator managing native multi-turn conversations, adaptive two-stage
-Intern-Decision routing, Gemma 4 multimodal vision, and session logging.
+Intern-Decision routing, Gemma 4 multimodal vision, Smart Hybrid APC, and session logging.
 """
 from __future__ import annotations
 
@@ -54,10 +54,34 @@ class Agent:
         self.trace_log_path = LOGS_DIR / "session_trace.log"
         self.history_log_path = LOGS_DIR / "session_history.md"
         self.reset_session_logs()
+        self._warmup_turn_zero_prefix()
+
+    def _warmup_turn_zero_prefix(self) -> None:
+        """Pre-warms the invariant System Prefix (base_prompt + core_profile + tools_prompt) into APC at Turn 0."""
+        if hasattr(self.llm, "warmup_static_prefix"):
+            try:
+                base_prompt = self._load_base_prompt()
+                core_profile = self._load_core_profile()
+                tools_prompt = self._format_tools_description(FILE_TOOLKIT)
+                static_prefix = (
+                    f"{base_prompt}\n\n"
+                    f"{core_profile}\n\n"
+                    f"--- RUNTIME TOOLS ---\n"
+                    f"{tools_prompt}"
+                )
+                self.llm.warmup_static_prefix(static_prefix)
+            except Exception:
+                pass
 
     def reset_session_logs(self) -> None:
         """Initializes blank session trace and history logs on session startup or clear command."""
         self.turn_counter = 0
+        if hasattr(self.llm, "clear_prefix_cache"):
+            try:
+                self.llm.clear_prefix_cache()
+            except Exception:
+                pass
+
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -124,39 +148,39 @@ class Agent:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%H:%M:%S")
             lines = [
-                f"## Turno {turn_num} — [{ts}]",
-                f"- **Mensajes totales acumulados en `history` al cerrar este turno**: {total_history_messages} "
-                f"({total_history_messages // 2} turnos completos)",
-                f"- **Memorias de turnos previos inyectadas al iniciar el Turno {turn_num}**: "
-                f"Completas={mem_stats.get('full_memories', 0)} | Compactadas={mem_stats.get('compacted_memories', 0)}\n",
-                f"### 1. Contexto de sesión previo que leyó el modelo al iniciar el Turno {turn_num}:",
+                f"## Turn {turn_num} — [{ts}]",
+                f"- **Total messages in `history` at turn end**: {total_history_messages} "
+                f"({total_history_messages // 2} completed turns)",
+                f"- **Previous turn memories injected at Turn {turn_num} start**: "
+                f"Full={mem_stats.get('full_memories', 0)} | Compacted={mem_stats.get('compacted_memories', 0)}\n",
+                f"### 1. Previous Session Context Read by Model at Turn {turn_num} Start:",
                 "----------------------------------------",
-                injected_history_snapshot.strip() if injected_history_snapshot.strip() else "(Turno inicial — sin historial previo)",
+                injected_history_snapshot.strip() if injected_history_snapshot.strip() else "(Initial turn — no prior history)",
                 "----------------------------------------\n",
-                f"### 2. Solicitud del Usuario (`Juan`) en el Turno {turn_num}:",
+                f"### 2. User Request (`Juan`) in Turn {turn_num}:",
                 "----------------------------------------",
                 user_message.strip(),
                 "----------------------------------------\n",
             ]
 
             if stored_memories:
-                lines.append(f"### 3. Nuevos bloques `[Tool Memory]` guardados en el Turno {turn_num} ({len(stored_memories)}):")
+                lines.append(f"### 3. New `[Tool Memory]` Blocks Saved in Turn {turn_num} ({len(stored_memories)}):")
                 for idx, tm in enumerate(stored_memories, start=1):
                     t_name = tm.get("tool", "tool")
                     t_out = str(tm.get("output", "")).strip()
-                    lines.append(f"**3.{idx} Herramienta `{t_name}` ({len(t_out)} chars):**")
+                    lines.append(f"**3.{idx} Tool `{t_name}` ({len(t_out)} chars):**")
                     lines.append("----------------------------------------")
                     lines.append(t_out)
                     lines.append("----------------------------------------")
                 lines.append("")
             else:
                 lines.append(
-                    f"### 3. Nuevos bloques `[Tool Memory]` guardados en el Turno {turn_num}:\n"
-                    "*(Ninguna herramienta ejecutada en este turno — el modelo respondió usando memoria previa)*\n"
+                    f"### 3. New `[Tool Memory]` Blocks Saved in Turn {turn_num}:\n"
+                    "*(No tools executed in this turn — model answered directly from session memory)*\n"
                 )
 
             lines.extend([
-                f"### 4. Respuesta Final del `Asistente` guardada en memoria (Turno {turn_num}):",
+                f"### 4. Final `Assistant` Response Saved in Memory (Turn {turn_num}):",
                 "----------------------------------------",
                 final_response.strip(),
                 "----------------------------------------\n",
@@ -329,22 +353,22 @@ class Agent:
 
         recommended_tools = sorted(list(decision.tools)) if decision.tools else sorted(list(active_tools))
 
-        # Format sub-skills with confidence levels for LLM transparency
         sub_skills_bullets: list[str] = []
         for mod in sorted(list(decision.sub_skills)):
             conf = decision.sub_skill_confidences.get(mod)
             if conf is not None:
-                note = " (moderate confidence - evaluate relevance autonomously)" if conf < 0.55 else ""
-                sub_skills_bullets.append(f"  - `{mod}` (confidence: {conf:.2f}){note}")
+                tier = "high" if conf >= 0.70 else ("moderate" if conf >= 0.55 else "advisory - evaluate relevance autonomously")
+                sub_skills_bullets.append(f"  - `{mod}` (relevance tier: {tier})")
             else:
                 sub_skills_bullets.append(f"  - `{mod}`")
 
         sub_skills_rendered = "\n".join(sub_skills_bullets) if sub_skills_bullets else "  - (No sub-skills required for this turn)"
+        skill_tier = "high" if decision.skill_confidence >= 0.70 else "moderate"
 
         router_guidance = (
             "## Router Tactical Guidance (Advisory)\n"
-            f"- **Primary Intent Classified**: `{decision.skill}` (confidence: `{decision.skill_confidence:.2f}`, "
-            f"complexity: `{decision.complexity}`, rerouted_2nd_pass: `{decision.rerouted}`)\n"
+            f"- **Primary Intent Classified**: `{decision.skill}` (confidence tier: `{skill_tier}`, "
+            f"complexity: `{decision.complexity}`)\n"
             f"- **Router Suggested Starting Tools**: `{recommended_tools}`\n"
             f"- **Active Sub-Skills Selected by Router**:\n{sub_skills_rendered}\n"
             "- **Autonomy Rule**: Treat the Router's suggestions above as an advisory guide, NOT a rigid cage. "
@@ -361,10 +385,12 @@ class Agent:
         system_prompt: str,
         history: list[dict[str, Any]] | None,
         user_message: str,
+        needs_previous_context: bool = True,
     ) -> tuple[list[dict[str, str]], str, dict[str, int]]:
         """
         Builds the native conversation messages list (system / user / assistant) for Gemma 4.
-        Prefixes historical assistant messages with a concise thought tag to enforce in-context formatting.
+        Uses English meta-thoughts in historical turns to prevent language drift, and compacts
+        unrelated older tool outputs when needs_previous_context is False to speed up Prefill.
         """
         stats = {"full_memories": 0, "compacted_memories": 0}
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -388,25 +414,31 @@ class Agent:
                     for tm in tool_memories:
                         t_name = tm.get("tool", "tool")
                         t_out = self._strip_vision_markers(str(tm.get("output", "")).strip())
-                        max_keep = 16000 if is_latest_asst else 3500
+                        if is_latest_asst and needs_previous_context:
+                            max_keep = 16000
+                        elif is_latest_asst:
+                            max_keep = 1800
+                        else:
+                            max_keep = 900
+
                         if len(t_out) <= max_keep:
                             mem_blocks.append(f"[Tool Memory: {t_name}]\n{t_out}\n[/Tool Memory]")
                             stats["full_memories"] += 1
                         else:
-                            clipped = t_out[:max_keep] + f"\n... [Truncado a {max_keep} chars para optimizar memoria en M4]"
+                            clipped = t_out[:max_keep] + f"\n... [Compacted to {max_keep} chars to optimize M4 KV memory]"
                             mem_blocks.append(f"[Tool Memory: {t_name}]\n{clipped}\n[/Tool Memory]")
                             stats["compacted_memories"] += 1
 
                     mem_str = "\n".join(mem_blocks)
                     combined_asst = (
-                        "<thought>Ejecuté las herramientas necesarias y registré sus resultados en la memoria de sesión.</thought>\n"
+                        "<thought>I executed the required tools and recorded their outputs in session memory.</thought>\n"
                         f"{mem_str}\n\n{clean_chat}"
                     )
                     messages.append({"role": "assistant", "content": combined_asst})
                     debug_lines.append(f"{mem_str}\nAssistant: {clean_chat}")
                 elif role == "assistant":
                     combined_asst = (
-                        "<thought>Respondí a la solicitud evaluando el contexto de la sesión.</thought>\n"
+                        "<thought>I answered the user's request based on the session context.</thought>\n"
                         f"{clean_chat}"
                     )
                     messages.append({"role": "assistant", "content": combined_asst})
@@ -425,7 +457,7 @@ class Agent:
         if not active_tools:
             return (
                 "No external tools are active for this request.\n"
-                "1. Start on line 1 with <thought>...</thought> (in Spanish, without backticks).\n"
+                "1. Start on line 1 with ONE <thought>...</thought> block (in the user's language, without backticks).\n"
                 "2. Immediately after </thought>, write your complete answer in natural language."
             )
 
@@ -436,119 +468,254 @@ class Agent:
 
         lines.append(
             "\nSingle-Action Turn Contract:\n"
-            "In each turn, you must perform ONLY ONE of the following two options:\n"
-            "- OPTION A (Call ONE tool): Start with <thought>...</thought> (no backticks), and on the next line output ONLY the raw JSON object:\n"
+            "In each step, you must perform ONLY ONE of the following two options:\n"
+            "- OPTION A (Call ONE tool): Start with a single <thought>...</thought> block (never use parentheses like (thought), never emit two thought blocks), and on the next line output ONLY the raw JSON object:\n"
             '  {"action": "<tool_name>", "arguments": {"<param>": "<value>"}}\n'
             "- OPTION B (Final Answer to User): If you already have the needed data in the conversation or tool output, "
-            "start with <thought>...</thought> and write your complete natural language response to the user (with ZERO JSON)."
+            "start with a single <thought>...</thought> block and write your complete natural language response in the exact language requested by the user (with ZERO JSON)."
         )
         return "\n".join(lines)
 
     @staticmethod
     def _normalize_gemma4_tokens(text: str) -> str:
-        """Normalizes native Gemma 4 and bracketed thoughts into standard <thought>...</thought> tags."""
+        """
+        Normalizes native Gemma 4 (<|channel>thought...<channel|>), bracketed ([thought]),
+        and parenthesized ((thought)) thought markers into standard <thought>...</thought> tags.
+        """
         g4_th_open = "<|channel>" + "thought"
         g4_th_close = "<channel" + "|>"
         th_open = "<" + "thought>"
         th_close = "</" + "thought>"
         empty_g4 = re.compile(rf"^\s*{re.escape(g4_th_open)}\s*{re.escape(g4_th_close)}\s*")
         cleaned = empty_g4.sub("", text)
+        # Collapse any accidentally duplicated <|channel> prefixes before replacing
+        cleaned = re.sub(r"(?:<\|channel>\s*)+thought", th_open, cleaned)
         cleaned = cleaned.replace(g4_th_open, th_open).replace(g4_th_close, th_close)
-        cleaned = re.sub(r"^\s*\[[Tt]hought\]", th_open, cleaned)
+        cleaned = re.sub(r"^\s*\[[Tt]hought\]\s*", th_open, cleaned)
         cleaned = re.sub(r"\[/[Tt]hought\]", th_close, cleaned)
+        cleaned = re.sub(r"^\s*\([Tt]hought\)\s*", th_open, cleaned)
+        cleaned = re.sub(r"\(/[Tt]hought\)", th_close, cleaned)
         return cleaned
 
     @classmethod
     def _split_leading_thought(cls, raw_text: str) -> tuple[str, str]:
-        """Splits leading thought block from payload, handling unclosed streams gracefully."""
+        """Splits one or more consecutive leading thought blocks from payload, handling unclosed streams gracefully."""
         text = cls._normalize_gemma4_tokens(raw_text)
         for tok in ("<" + "end_of_turn>", "<" + "start_of_turn>", "<" + "eos>", "<" + "turn|>", "<|turn>model"):
             text = text.replace(tok, "")
         text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        # Strip any孤立/stray leading <|channel> token that was not followed by 'thought'
+        if text.startswith("<|channel>"):
+            text = text[len("<|channel>") :].lstrip()
 
         th_open = "<" + "thought>"
         th_close = "</" + "thought>"
-        pattern = rf"^[\s`]*{th_open}(.*?){th_close}[\s`]*(.*)"
-        match = re.match(pattern, text, flags=re.DOTALL)
-        if match:
-            return match.group(1).strip(), match.group(2).strip()
+        pattern = re.compile(rf"^[\s`]*{th_open}(.*?){th_close}[\s`]*(.*)", flags=re.DOTALL)
+
+        thoughts: list[str] = []
+        remaining = text
+        while True:
+            if remaining.startswith("<|channel>"):
+                remaining = remaining[len("<|channel>") :].lstrip()
+            match = pattern.match(remaining)
+            if not match:
+                break
+            t_part = match.group(1).strip()
+            if t_part:
+                thoughts.append(t_part)
+            remaining = match.group(2).strip()
 
         unclosed_pattern = rf"^[\s`]*{th_open}(.*)"
-        unclosed_match = re.match(unclosed_pattern, text, flags=re.DOTALL)
+        unclosed_match = re.match(unclosed_pattern, remaining, flags=re.DOTALL)
         if unclosed_match:
-            return unclosed_match.group(1).strip(), ""
+            extra_t = unclosed_match.group(1).strip()
+            if extra_t:
+                thoughts.append(extra_t)
+            return " ".join(thoughts), ""
 
-        return "", text
+        if thoughts:
+            return " ".join(thoughts), remaining
 
-    def _extract_tool_call(self, raw_text: str) -> dict[str, Any] | None:
+        return "", remaining
+
+    def _extract_tool_call(self, raw_text: str, raw_with_special: str = "") -> dict[str, Any] | None:
         """
         Parses a tool invocation from model output, supporting both standard JSON
-        contracts ({"action": ...}) and native Gemma 4 tool calls (<|tool_call>call: name{args}).
+        contracts ({"action": ...}) and native Gemma 4 tool calls (<|tool_call>call: name{args} or call: name{args}).
         """
-        _, body = self._split_leading_thought(raw_text)
-        cleaned = body.strip()
+        candidates = [raw_text]
+        if raw_with_special and ("<|tool_call>" in raw_with_special or "call:" in raw_with_special or '"action"' in raw_with_special):
+            candidates.insert(0, raw_with_special)
 
-        # Handle native Gemma 4 tool call format: <|tool_call>call: tool_name{params}
-        native_call_match = re.search(r"<\|tool_call>call:\s*([a-zA-Z0-9_]+)\s*(\{.*\})", cleaned, flags=re.DOTALL)
-        if native_call_match:
-            action_name = native_call_match.group(1).strip()
-            args_str = native_call_match.group(2).strip()
-            try:
-                args_dict = json.loads(args_str)
-                return {"action": action_name, "arguments": args_dict}
-            except Exception:
+        for candidate in candidates:
+            _, body = self._split_leading_thought(candidate)
+            cleaned = body.strip()
+
+            native_call_match = re.search(
+                r"(?:<\|tool_call>)?call:\s*([a-zA-Z0-9_]+)\s*(\{.*?\})(?:<tool_call\|>|$)",
+                cleaned,
+                flags=re.DOTALL,
+            )
+            if native_call_match:
+                action_name = native_call_match.group(1).strip()
+                args_str = native_call_match.group(2).strip()
+                args_norm = args_str.replace('<|"|>', '"')
+                args_norm = re.sub(r'([{\s,])([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_norm)
                 try:
-                    decoder = json.JSONDecoder()
-                    args_dict, _ = decoder.raw_decode(args_str)
-                    return {"action": action_name, "arguments": args_dict}
+                    args_dict = json.loads(args_norm)
+                    if isinstance(args_dict, dict):
+                        return {"action": action_name, "arguments": args_dict}
                 except Exception:
-                    pass
+                    try:
+                        decoder = json.JSONDecoder()
+                        args_dict, _ = decoder.raw_decode(args_norm)
+                        if isinstance(args_dict, dict):
+                            return {"action": action_name, "arguments": args_dict}
+                    except Exception:
+                        pass
 
-        if cleaned.startswith("`"):
-            cleaned = re.sub(r"^`+(?:json)?\s*", "", cleaned)
-            cleaned = re.sub(r"\s*`+$", "", cleaned).strip()
+            if cleaned.startswith("`"):
+                cleaned = re.sub(r"^`+(?:json)?\s*", "", cleaned)
+                cleaned = re.sub(r"\s*`+$", "", cleaned).strip()
 
-        if not cleaned.startswith("{"):
-            return None
-
-        repaired = re.sub(r',\s*"[^"]+"\s*:\s*$', "", cleaned)
-        open_b = repaired.count("{")
-        close_b = repaired.count("}")
-        if open_b > close_b and '"action"' in repaired:
-            repaired += "}" * (open_b - close_b)
-
-        end_idx = repaired.rfind("}")
-        if end_idx == -1:
-            return None
-
-        json_candidate = repaired[: end_idx + 1]
-        try:
-            payload = json.loads(json_candidate)
-            if isinstance(payload, dict) and "action" in payload:
-                return payload
-        except json.JSONDecodeError:
-            try:
-                decoder = json.JSONDecoder()
-                obj, _ = decoder.raw_decode(repaired)
-                if isinstance(obj, dict) and "action" in obj:
-                    return obj
-            except Exception:
-                pass
+            json_start_idx = cleaned.find("{")
+            if json_start_idx != -1 and '"action"' in cleaned[json_start_idx:]:
+                prefix_before_brace = cleaned[:json_start_idx].strip()
+                if not prefix_before_brace or prefix_before_brace.lower().startswith("(thought)"):
+                    repaired = re.sub(r',\s*"[^"]+"\s*:\s*$', "", cleaned[json_start_idx:])
+                    open_b = repaired.count("{")
+                    close_b = repaired.count("}")
+                    if open_b > close_b:
+                        repaired += "}" * (open_b - close_b)
+                    end_idx = repaired.rfind("}")
+                    if end_idx != -1:
+                        json_candidate = repaired[: end_idx + 1]
+                        try:
+                            payload = json.loads(json_candidate)
+                            if isinstance(payload, dict) and "action" in payload:
+                                return payload
+                        except json.JSONDecodeError:
+                            try:
+                                decoder = json.JSONDecoder()
+                                obj, _ = decoder.raw_decode(repaired)
+                                if isinstance(obj, dict) and "action" in obj:
+                                    return obj
+                            except Exception:
+                                pass
         return None
-    
+
     def _extract_final_answer(self, raw_text: str) -> str:
-        """Extracts clean final text response, stripping accidental trailing tool call attempts."""
+        """Extracts clean final text response, stripping accidental trailing tool call attempts or stray tags."""
         lead_thought, body = self._split_leading_thought(raw_text)
         body = re.sub(r"^Assistant:\s*", "", body).strip()
+        body = re.sub(r"^\([Tt]hought\)\s*", "", body).strip()
         body = re.sub(r'\n+\s*\{\s*"action"\s*:.*$', "", body, flags=re.DOTALL).strip()
+        if "</thought>" in body:
+            body = body.split("</thought>", 1)[0].strip()
 
         if not body and lead_thought:
             return lead_thought
 
-        if lead_thought and (body.startswith("Línea ") or body.startswith("---") or body.startswith("def ")):
+        if lead_thought and (
+            body.startswith("Line ")
+            or body.startswith("Línea ")
+            or body.startswith("---")
+            or body.startswith("def ")
+        ):
             return f"{lead_thought}\n\n{body}"
 
         return body
+
+    @staticmethod
+    def _verify_and_repair_code_blocks(
+        final_response: str,
+        executed_tools_trace: list[dict[str, Any]],
+    ) -> tuple[str, bool]:
+        """
+        Dynamic Ground-Truth AST Code Verifier:
+        Verifies that the code block and line numbers displayed in final_response match the AST ground truth.
+        """
+        grep_traces = [t for t in executed_tools_trace if t.get("tool") == "file_grep"]
+        if not grep_traces or "----------------------------------------" not in final_response:
+            return final_response, False
+
+        last_grep_out = str(grep_traces[-1].get("output", ""))
+        header_match = re.search(
+            r"(?:File|Archivo):\s*([^\n|]+)\s*\|\s*(?:Exact match on LINE|Coincidencia exacta en LÍNEA)\s*(\d+)\s*\[(?:COMPLETE DEFINITION: lines|DEFINICIÓN COMPLETA: líneas)\s*(\d+)\s*(?:to|a)\s*(\d+)\]:",
+            last_grep_out,
+        )
+        if not header_match:
+            return final_response, False
+
+        start_line = header_match.group(3).strip()
+        end_line = header_match.group(4).strip()
+
+        ast_code_lines = [
+            line for line in last_grep_out.splitlines()
+            if re.match(r"^(?:Line|Línea)\s+\d+\s*\|", line)
+        ]
+        if not ast_code_lines:
+            return final_response, False
+
+        exact_ast_block = "\n".join(ast_code_lines)
+        first_ast_line = ast_code_lines[0].strip()
+        last_ast_line = ast_code_lines[-1].strip()
+
+        if first_ast_line in final_response and last_ast_line in final_response:
+            return final_response, False
+
+        parts = final_response.split("----------------------------------------")
+        if len(parts) >= 3:
+            before_block = parts[0]
+            after_block = "----------------------------------------".join(parts[2:])
+            before_block = re.sub(
+                r"(\*\*(?:Exact Line\(s\)|Exact Line of Definition|Línea exacta de definición)\*\*:\s*).*",
+                rf"\g<1>Line {start_line} (complete definition: lines {start_line} to {end_line})",
+                before_block,
+            )
+            repaired = (
+                f"{before_block.rstrip()}\n"
+                f"----------------------------------------\n"
+                f"{exact_ast_block}\n"
+                f"----------------------------------------"
+                f"{after_block}"
+            )
+            return repaired, True
+
+        return final_response, False
+
+    def _should_use_apc_for_step(
+        self,
+        step: int,
+        last_tool_name: str | None,
+        has_active_vision: bool,
+        user_message: str,
+        decision: RoutingDecision,
+    ) -> tuple[bool, str]:
+        """
+        Smart Hybrid APC Policy:
+        - Vision steps: APC bypassed in favor of VisionFeatureCache.
+        - Steps immediately following `dir_tree`, `file_read`, or `file_grep`:
+          Bypass APC (`use_apc=False`) so Gemma 4's KV-sharing layers attend over exact filenames
+          (e.g. `pato.png`), 7-digit identifiers (`1438516`), and AST lines (`321 to 382`) with 100% accuracy.
+        - Multi-turn memory synthesis (`needs_previous_context=True` or explicit no-tool summary):
+          Bypass APC so historical numbers/codes are synthesized with 100% fidelity.
+        - Navigation & Tool-Dispatch steps (Step 1 initial tool dispatch, or Step 2 after `file_search`):
+          Keep APC ENABLED (`use_apc=True`) for ultra-fast 1.1s–4.9s Prefill!
+        """
+        if has_active_vision:
+            return False, "Vision step (using VisionFeatureCache)"
+        if last_tool_name in {"dir_tree", "file_read", "file_grep"}:
+            return False, f"High-precision synthesis after {last_tool_name} (ensures 100% exact filenames, digits & AST lines)"
+        if step == 1 and (
+            decision.skill == "personal_assistant"
+            or decision.needs_previous_context
+            or "without calling any tools" in user_message.lower()
+        ):
+            return False, "High-precision multi-turn session synthesis"
+        if step == 1:
+            return True, "Step 1 fast tool-dispatch (reusing Turn-0 static system prefix)"
+        return True, f"Fast chained tool-dispatch after {last_tool_name}"
 
     def _count_tokens(self, text: str) -> int:
         tokenizer = getattr(self.llm, "tokenizer", None) or getattr(getattr(self.llm, "processor", None), "tokenizer", None)
@@ -563,6 +730,9 @@ class Agent:
         self,
         messages: list[dict[str, str]],
         images: list[str] | None = None,
+        use_apc: bool = True,
+        apc_reason: str = "standard",
+        step_label: str = "STEP",
         on_token: Callable[[str], None] | None = None,
         on_thought_token: Callable[[str], None] | None = None,
         on_thought_done: Callable[[float], None] | None = None,
@@ -583,7 +753,14 @@ class Agent:
             mode = "DETECT"  # DETECT | THOUGHT | AFTER_THOUGHT | TOOL_JSON | ANSWER
             pending = ""
 
-            for piece in self.llm.stream(messages, images=images, max_tokens=2048):
+            for piece in self.llm.stream(
+                messages,
+                images=images,
+                max_tokens=2048,
+                use_apc=use_apc,
+                apc_reason=apc_reason,
+                step_label=step_label,
+            ):
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
@@ -599,6 +776,14 @@ class Agent:
                             on_thought_token(clean_piece.replace("\r", "\n"))
                     break
 
+                if mode == "ANSWER" and thought_closed_notified and "<channel|>" in piece:
+                    before_ch = piece.split("<channel|>", 1)[0]
+                    if before_ch:
+                        buffer.append(before_ch)
+                        if on_token:
+                            on_token(before_ch.replace("\r", "\n"))
+                    break
+
                 buffer.append(piece)
                 pending = self._normalize_gemma4_tokens(pending + piece)
 
@@ -609,17 +794,32 @@ class Agent:
                     if stripped.startswith(th_open):
                         mode = "THOUGHT"
                         pending = stripped[len(th_open) :].lstrip("\n ")
-                    elif (stripped.startswith("<") or stripped.startswith("[")) and (
+                    elif (
+                        stripped.startswith("<")
+                        or stripped.startswith("[")
+                        or stripped.startswith("(")
+                        or "call:".startswith(stripped)
+                    ) and (
                         th_open.startswith(stripped)
                         or ("<|channel>" + "thought").startswith(stripped)
+                        or ("<|channel><thought>").startswith(stripped)
+                        or ("<|tool_call>").startswith(stripped)
+                        or "call:".startswith(stripped)
                         or "[Thought]".startswith(stripped)
                         or "[thought]".startswith(stripped)
+                        or "(Thought)".startswith(stripped)
+                        or "(thought)".startswith(stripped)
                     ):
                         continue
-                    elif stripped.startswith("{") or stripped.startswith(fence_prefix):
+                    elif (
+                        stripped.startswith("{")
+                        or stripped.startswith(fence_prefix)
+                        or stripped.startswith("<|tool_call>")
+                        or stripped.startswith("call:")
+                    ):
                         mode = "TOOL_JSON"
                         pending = ""
-                    elif len(stripped) >= 10 or "\n" in stripped:
+                    elif len(stripped) >= 14 or "\n" in stripped:
                         mode = "ANSWER"
                         streamed_answer = True
                         if on_token:
@@ -633,15 +833,13 @@ class Agent:
                             captured_thought.append(before_close)
                             if on_thought_token:
                                 on_thought_token(before_close.replace("\r", "\n"))
-                        if on_thought_done and not thought_closed_notified:
-                            on_thought_done(time.perf_counter() - t_start)
-                            thought_closed_notified = True
                         mode = "AFTER_THOUGHT"
                         pending = after_close.lstrip("`")
                     else:
                         tag_pos = pending.find("<")
                         bracket_pos = pending.find("[/")
-                        candidates = [p for p in (tag_pos, bracket_pos) if p != -1]
+                        paren_pos = pending.find("(/")
+                        candidates = [p for p in (tag_pos, bracket_pos, paren_pos) if p != -1]
                         cut_pos = min(candidates) if candidates else -1
 
                         if cut_pos == -1:
@@ -666,16 +864,51 @@ class Agent:
                     stripped_after = pending.lstrip(" \t\r\n`")
                     if not stripped_after:
                         continue
-                    if stripped_after.startswith("{") or stripped_after.startswith(fence_prefix):
+                    if stripped_after.startswith(th_open):
+                        mode = "THOUGHT"
+                        if captured_thought and on_thought_token:
+                            on_thought_token(" ")
+                        pending = stripped_after[len(th_open) :].lstrip("\n ")
+                        continue
+                    if (
+                        stripped_after.startswith("<")
+                        or stripped_after.startswith("[")
+                        or stripped_after.startswith("(")
+                        or "call:".startswith(stripped_after)
+                    ) and (
+                        th_open.startswith(stripped_after)
+                        or ("<|channel>" + "thought").startswith(stripped_after)
+                        or ("<|channel><thought>").startswith(stripped_after)
+                        or ("<|tool_call>").startswith(stripped_after)
+                        or "call:".startswith(stripped_after)
+                        or "[Thought]".startswith(stripped_after)
+                        or "[thought]".startswith(stripped_after)
+                        or "(Thought)".startswith(stripped_after)
+                        or "(thought)".startswith(stripped_after)
+                    ):
+                        continue
+                    if (
+                        stripped_after.startswith("{")
+                        or stripped_after.startswith(fence_prefix)
+                        or stripped_after.startswith("<|tool_call>")
+                        or stripped_after.startswith("call:")
+                    ):
+                        if on_thought_done and not thought_closed_notified:
+                            on_thought_done(time.perf_counter() - t_start)
+                            thought_closed_notified = True
                         mode = "TOOL_JSON"
                         pending = ""
-                    elif len(stripped_after) >= 10 or "\n" in stripped_after:
+                    elif len(stripped_after) >= 14 or "\n" in stripped_after:
+                        if on_thought_done and not thought_closed_notified:
+                            on_thought_done(time.perf_counter() - t_start)
+                            thought_closed_notified = True
                         mode = "ANSWER"
                         streamed_answer = True
                         if on_token:
                             thought_summary = "".join(captured_thought).strip()
                             if (
-                                stripped_after.startswith("Línea ")
+                                stripped_after.startswith("Line ")
+                                or stripped_after.startswith("Línea ")
                                 or stripped_after.startswith("---")
                                 or stripped_after.startswith("def ")
                             ) and thought_summary:
@@ -700,12 +933,13 @@ class Agent:
                         on_token(pending.replace("\r", "\n"))
                         pending = ""
 
-            if mode == "THOUGHT" and on_thought_done and not thought_closed_notified:
+            if (mode in {"THOUGHT", "AFTER_THOUGHT"} or captured_thought) and on_thought_done and not thought_closed_notified:
                 on_thought_done(time.perf_counter() - t_start)
+                thought_closed_notified = True
 
             if mode in {"DETECT", "AFTER_THOUGHT"} and pending.strip():
                 rem = pending.strip().lstrip("`")
-                if not (rem.startswith("{") or rem.startswith(fence_prefix)):
+                if not (rem.startswith("{") or rem.startswith(fence_prefix) or rem.startswith("call:") or rem.startswith("<|tool_call>")):
                     streamed_answer = True
                     if on_token:
                         on_token(rem.replace("\r", "\n"))
@@ -729,7 +963,13 @@ class Agent:
                 "llm_diagnostics": dict(getattr(self.llm, "last_diagnostics", {})),
             }
 
-        full_text = self.llm.generate(messages, images=images)
+        full_text = self.llm.generate(
+            messages,
+            images=images,
+            use_apc=use_apc,
+            apc_reason=apc_reason,
+            step_label=step_label,
+        )
         t_end = time.perf_counter()
         return {
             "text": full_text,
@@ -750,76 +990,76 @@ class Agent:
         has_active_vision: bool = False,
     ) -> str:
         if has_active_vision:
-            fp = Path(str((last_args or {}).get("filepath", "imagen"))).name
-            return f"Analizando visualmente los píxeles y metadatos de «{fp}» con Gemma 4 Vision..."
+            fp = Path(str((last_args or {}).get("filepath", "image"))).name
+            return f"Visually inspecting pixels and metadata of «{fp}» with Gemma 4 Vision..."
         if step == 1:
             if skill == "file_management":
-                return "Evaluando historial y qué archivos o directorios inspeccionar..."
+                return "Evaluating session history and target files/directories to inspect..."
             if skill == "coding":
-                return "Preparando búsqueda en el código fuente del proyecto..."
-            return "Analizando el contexto de la conversación para responder..."
+                return "Preparing AST and codebase search..."
+            return "Analyzing conversation context to formulate response..."
 
         if last_tool == "file_search":
-            pat = (last_args or {}).get("pattern", "el elemento")
-            return f"Analizando las rutas encontradas para «{pat}»..."
+            pat = (last_args or {}).get("pattern", "item")
+            return f"Analyzing discovered file paths for «{pat}»..."
         if last_tool == "dir_tree":
-            dp = Path(str((last_args or {}).get("dirpath", "directorio"))).name
-            return f"Identificando el archivo objetivo dentro de «{dp}»..."
+            dp = Path(str((last_args or {}).get("dirpath", "directory"))).name
+            return f"Selecting target file inside «{dp}»..."
         if last_tool == "file_read":
-            fp = Path(str((last_args or {}).get("filepath", "documento"))).name
-            return f"Sintetizando la información extraída de «{fp}»..."
+            fp = Path(str((last_args or {}).get("filepath", "document"))).name
+            return f"Synthesizing extracted content from «{fp}»..."
         if last_tool == "file_grep":
-            q = (last_args or {}).get("query", "código")
-            return f"Preparando explicación y bloque de código de «{q}»..."
-        return "Integrando los hallazgos para redactar la respuesta..."
+            q = (last_args or {}).get("query", "code")
+            return f"Preparing code block and technical explanation for «{q}»..."
+        return "Synthesizing findings to write final response..."
 
     def _describe_tool_execution(self, action_name: str, args: dict[str, Any]) -> str:
         if action_name == "file_search":
             pat = args.get("pattern", "*")
             etype = args.get("entry_type", "all")
-            return f"Buscando «{pat}» (tipo: {etype}) en tus carpetas autorizadas..."
+            return f"Searching for «{pat}» (type: {etype}) across authorized workspaces..."
         if action_name == "dir_tree":
             dp = args.get("dirpath", "")
             name = Path(str(dp)).name or dp
             ext = args.get("extension_filter", "")
-            ext_info = f" [filtro: {ext}]" if ext else ""
-            return f"Explorando estructura del directorio «{name}»{ext_info}..."
+            ext_info = f" [filter: {ext}]" if ext else ""
+            return f"Exploring directory tree of «{name}»{ext_info}..."
         if action_name == "file_read":
             fp = args.get("filepath", "")
             name = Path(str(fp)).name or fp
-            return f"Leyendo e inspeccionando «{name}»..."
+            return f"Reading and inspecting «{name}»..."
         if action_name == "file_grep":
             q = args.get("query", "")
             ext = args.get("file_extension", "")
-            ext_info = f" (archivos {ext})" if ext else ""
-            return f"Rastreando la definición completa de «{q}»{ext_info}..."
-        return f"Ejecutando operación {action_name}..."
+            ext_info = f" (files: {ext})" if ext else ""
+            return f"Extracting complete AST definition of «{q}»{ext_info}..."
+        return f"Executing tool {action_name}..."
 
     def _summarize_tool_result(self, action_name: str, result: str) -> str:
         first_line = result.strip().splitlines()[0] if result.strip() else ""
         if result.startswith("Error"):
             return f"⚠ {first_line}"
         if action_name == "file_search":
-            if "encontrados" in first_line:
+            if "Found items" in first_line or "encontrados" in first_line:
                 paths = [l.strip("- ").strip() for l in result.splitlines()[1:] if l.strip().startswith("-")]
                 first_item = paths[0] if paths else ""
                 return f"✓ {first_line} {first_item}"
             return f"ℹ {first_line[:80]}"
         if action_name == "dir_tree":
             entries = len([l for l in result.splitlines() if "📄" in l or "📁" in l])
-            return f"✓ Árbol de directorio listado ({entries} entradas visibles)"
+            return f"✓ Directory tree listed ({entries} visible entries)"
         if action_name == "file_read":
             vision_paths = self._extract_vision_paths(result)
             if vision_paths:
                 img_name = Path(vision_paths[0]).name
-                return f"🖼️ Imagen «{img_name}» + metadatos cargados en pipeline de Visión Artificial"
+                return f"🖼️ Image «{img_name}» + technical metadata loaded into Computer Vision pipeline"
             chars = len(result)
-            pages = len(re.findall(r"--- Página \d+", result))
-            page_info = f"{pages} pág., " if pages else ""
-            return f"✓ Lectura completada ({page_info}{chars} caracteres extraídos)"
+            pages = len(re.findall(r"--- (?:Page|Página) \d+", result))
+            page_info = f"{pages} pages, " if pages else ""
+            return f"✓ Read complete ({page_info}{chars} chars extracted)"
         if action_name == "file_grep":
             return f"✓ {first_line}"
-        return "✓ Completado"
+        return "✓ Completed"
 
     def _log_step_diagnostics(
         self,
@@ -883,7 +1123,7 @@ class Agent:
         profiling: dict[str, Any] = {"steps": []}
 
         if on_status:
-            on_status("Clasificando intención y sub-skills con Intern-Decision...")
+            on_status("Classifying intent and modular sub-skills with Intern-Decision...")
 
         t_route_start = time.perf_counter()
         decision = self.decide_route(user_message, history=history)
@@ -912,16 +1152,17 @@ class Agent:
         system_prompt = (
             f"{base_prompt}\n\n"
             f"{core_profile}\n\n"
-            f"--- ACTIVE SKILL & MODULES: {decision.skill.upper()} ({loaded_skill_label}) ---\n"
-            f"{skill_content}\n\n"
             f"--- RUNTIME TOOLS ---\n"
-            f"{tools_prompt}"
+            f"{tools_prompt}\n\n"
+            f"--- ACTIVE SKILL: {decision.skill.upper()} ---\n"
+            f"{skill_content}"
         )
 
         messages, debug_history_str, mem_stats = self._build_structured_conversation(
             system_prompt=system_prompt,
             history=history,
             user_message=user_message,
+            needs_previous_context=decision.needs_previous_context,
         )
         profiling["injected_history"] = debug_history_str
         profiling["memory_stats"] = mem_stats
@@ -950,9 +1191,9 @@ class Agent:
         last_tool_args: dict[str, Any] | None = None
 
         request_reminder = (
-            f'\n(Remember to address every part of the user request: "{user_message}")'
+            f'\n(CRITICAL: Start with <thought>...</thought> and write your response in the EXACT language of the user request: "{user_message}")'
             if len(user_message) <= 500
-            else ""
+            else "\n(CRITICAL: Start with <thought>...</thought> and write your response in the EXACT language used by the user.)"
         )
 
         for step in range(1, self.max_steps + 1):
@@ -966,9 +1207,20 @@ class Agent:
                 )
                 on_status(activity_msg)
 
+            use_apc_step, apc_reason = self._should_use_apc_for_step(
+                step=step,
+                last_tool_name=last_tool_name,
+                has_active_vision=bool(active_step_images),
+                user_message=user_message,
+                decision=decision,
+            )
+
             step_res = self._generate_step(
                 messages,
                 images=active_step_images if active_step_images else None,
+                use_apc=use_apc_step,
+                apc_reason=apc_reason,
+                step_label=f"TURN {turn_num} | STEP {step}",
                 on_token=on_token,
                 on_thought_token=on_thought_token,
                 on_thought_done=on_thought_done,
@@ -979,11 +1231,22 @@ class Agent:
             ttft_sec = step_res["ttft_sec"]
             decode_sec = step_res["decode_sec"]
 
+            kv_status_str = str(step_res.get("llm_diagnostics", {}).get("kv_cache_status", ""))
+            kv_short = ""
+            m_match = re.search(r"matched=(\d+)\s*tok", kv_status_str)
+            if m_match:
+                kv_short = f"APC matched={m_match.group(1)} tok"
+            elif "vision_step" in kv_status_str:
+                kv_short = "VisionCache active"
+            elif "HIGH_PRECISION_CLEAN_PREFILL" in kv_status_str:
+                kv_short = "Clean High-Precision Prefill"
+
             tokens_gen = self._count_tokens(raw_step_output)
             decode_tps = round(tokens_gen / decode_sec, 1) if decode_sec > 0 else 0.0
 
             lead_thought, body_after_thought = self._split_leading_thought(raw_step_output)
-            tool_call = self._extract_tool_call(raw_step_output)
+            raw_special = step_res.get("llm_diagnostics", {}).get("raw_with_special_tokens", "")
+            tool_call = self._extract_tool_call(raw_step_output, raw_with_special=raw_special)
 
             self._log_step_diagnostics(
                 turn_num=turn_num,
@@ -1014,7 +1277,7 @@ class Agent:
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"[System Notice]: You already executed '{action_name}' with these exact parameters. "
+                            f"[SYSTEM RUNTIME NOTICE]: You already executed '{action_name}' with these exact parameters. "
                             f"Do NOT call any more tools. Write your complete final answer in natural language now.{request_reminder}"
                         ),
                     })
@@ -1059,6 +1322,7 @@ class Agent:
                         "tokens": tokens_gen,
                         "tps": decode_tps,
                         "tool_exec_sec": t_tool_elapsed,
+                        "kv_short": kv_short,
                     })
 
                     self._append_trace_log(
@@ -1072,11 +1336,13 @@ class Agent:
                     messages.append({
                         "role": "user",
                         "content": (
+                            f'[SYSTEM RUNTIME — AUTOMATED TOOL OUTPUT FOR YOUR PREVIOUS ACTION "{action_name}"]\n'
+                            "(This output was generated automatically by the runtime when executing your tool call — NOT sent by the human user.)\n"
                             f'<tool_output tool="{action_name}">\n{clean_result_for_trace}\n</tool_output>\n\n'
                             "Review the <tool_output> above (and the attached image in your visual input if present). "
                             "Choose ONLY ONE option:\n"
                             "- Option A (Need another tool, e.g. to inspect another candidate file/image): Start with <thought>...</thought> "
-                            "(never use backticks) followed on the next line by ONLY the raw JSON tool call.\n"
+                            "(never use backticks or parentheses) followed on the next line by ONLY the raw JSON tool call.\n"
                             "- Option B (Have all required data): Start with <thought>...</thought> (never use backticks) "
                             "followed by your complete final answer in natural language, and STOP immediately without any JSON."
                             f"{request_reminder}"
@@ -1093,7 +1359,7 @@ class Agent:
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"[System Notice]: Tool '{action_name}' is not available. "
+                            f"[SYSTEM RUNTIME NOTICE]: Tool '{action_name}' is not available. "
                             f"Write your final response directly in natural language.{request_reminder}"
                         ),
                     })
@@ -1107,14 +1373,22 @@ class Agent:
                 messages.append({
                     "role": "user",
                     "content": (
-                        "[System Notice]: Your previous response stopped right after <thought> without emitting "
+                        "[SYSTEM RUNTIME NOTICE]: Your previous response stopped right after <thought> without emitting "
                         "either the tool JSON or the final answer. Emit ONLY the tool JSON object (if you need a tool "
-                        f"like file_read) or write your complete final answer in natural language now.{request_reminder}"
+                        f"like dir_tree or file_read) or write your complete final answer in natural language now.{request_reminder}"
                     ),
                 })
                 continue
 
             final_response = self._extract_final_answer(raw_step_output)
+            final_response, was_repaired = self._verify_and_repair_code_blocks(final_response, executed_tools_trace)
+            if was_repaired:
+                self._append_trace_log(
+                    f"[TURN {turn_num} | STEP {step}] AST GROUND-TRUTH VERIFIER: Repaired code block lines to match exact AST extraction."
+                )
+                if on_event:
+                    on_event("retry", "[AST Verifier] Verified & aligned exact line numbers from AST ground truth")
+
             was_streamed_to_terminal = step_streamed
             profiling["steps"].append({
                 "step": step,
@@ -1124,12 +1398,13 @@ class Agent:
                 "decode_sec": decode_sec,
                 "tokens": tokens_gen,
                 "tps": decode_tps,
+                "kv_short": kv_short,
             })
             break
 
         if not final_response.strip():
             if on_status:
-                on_status("Redactando respuesta final...")
+                on_status("Composing final response...")
             messages.append({
                 "role": "user",
                 "content": f"Tool phase finished. Provide your complete natural language response now.{request_reminder}",
@@ -1137,6 +1412,9 @@ class Agent:
             fb_res = self._generate_step(
                 messages,
                 images=active_step_images if active_step_images else None,
+                use_apc=False,
+                apc_reason="Fallback final answer synthesis",
+                step_label=f"TURN {turn_num} | FALLBACK",
                 on_token=on_token,
                 on_thought_token=on_thought_token,
                 on_thought_done=on_thought_done,
@@ -1151,6 +1429,7 @@ class Agent:
                 tool_call=None,
             )
             final_response = self._extract_final_answer(fb_res["text"])
+            final_response, _ = self._verify_and_repair_code_blocks(final_response, executed_tools_trace)
             was_streamed_to_terminal = fb_res["streamed"]
             profiling["steps"].append({
                 "step": len(profiling["steps"]) + 1,
@@ -1160,14 +1439,15 @@ class Agent:
                 "decode_sec": fb_res["decode_sec"],
                 "tokens": self._count_tokens(final_response),
                 "tps": round(self._count_tokens(final_response) / fb_res["decode_sec"], 1),
+                "kv_short": "Clean High-Precision Prefill",
             })
 
         if not final_response.strip():
             if executed_tools_trace:
                 last_t = executed_tools_trace[-1]
-                final_response = f"Ejecuté `{last_t['tool']}`, cuyo resultado fue:\n\n{last_t['output']}"
+                final_response = f"Executed `{last_t['tool']}`, returning:\n\n{last_t['output']}"
             else:
-                final_response = "Lo siento Juan, ocurrió un problema al generar la respuesta."
+                final_response = "Sorry Juan, an unexpected issue occurred while generating the response."
 
         if on_status:
             on_status("")

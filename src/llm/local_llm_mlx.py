@@ -1,32 +1,52 @@
 """
-Backend local MLX-VLM optimized for Gemma 4 with prefix KV caching,
-multimodal vision support, special token debugging, and session telemetry.
+Local MLX-VLM backend optimized for Gemma 4 with native Automatic Prefix Caching (APC),
+Turn-0 static prefix warmup, VisionFeatureCache, and dynamic cache_trace.log inspection.
 """
 from __future__ import annotations
 
-import copy
+from datetime import datetime
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterator
+
+# Ensure APC environment variables are set before MLX-VLM cache initialization
+os.environ.setdefault("APC_ENABLED", "1")
+os.environ.setdefault("APC_CHECKPOINT_ENTRIES", "32")
+os.environ.setdefault("APC_CHECKPOINT_INTERVAL_TOKENS", "0")
+os.environ.setdefault("APC_CHECKPOINT_GUARD_TOKENS", "1")
+os.environ.setdefault("APC_DISK_ENABLED", "0")
+os.environ.setdefault("APC_MEMORY_MAX_GB", "3.5")
+os.environ.setdefault("APC_MEMORY_RESERVE_GB", "1.5")
+
 import mlx.core as mx
 from mlx_vlm import load, generate, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from PIL import Image
 
 try:
-    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.apc import APCManager
 except ImportError:
-    try:
-        from mlx_lm.models.cache import make_prompt_cache
-    except ImportError:
-        make_prompt_cache = None
+    APCManager = None
+
+try:
+    from mlx_vlm import VisionFeatureCache
+except ImportError:
+    VisionFeatureCache = None
 
 from .base import LLM
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOGS_DIR = PROJECT_ROOT / "logs"
+
 
 class LocalLLMMLX(LLM):
-    STOP_TOKENS = ("<" + "turn|>", "<" + "end_of_turn>", "<" + "eos>", "<" + "start_of_turn>")
-    STOP_TOKEN_IDS = {1, 106}  # 1 = '<eos>', 106 = '<turn|>' in Gemma 4
-    PAD_TOKEN_ID = 0           # 0 = '<pad>' in Gemma 4
+    STOP_TOKENS = ("<" + "turn|>", "<" + "end_of_turn>", "<" + "eos>", "<" + "start_of_turn>", "<" + "tool_call|>")
+    STOP_TOKEN_IDS = {1, 49, 106}  # 1 = '<eos>', 49 = '<tool_call|>', 106 = '<turn|>' in Gemma 4
+    CHANNEL_OPEN_TOKEN_ID = 100    # 100 = '<|channel>' in Gemma 4
+    CHANNEL_CLOSE_TOKEN_ID = 101   # 101 = '<channel|>' in Gemma 4
+    PAD_TOKEN_ID = 0               # 0 = '<pad>' in Gemma 4
+    PREFILL_STEP_SIZE = 4096
 
     def __init__(self, model_path: str) -> None:
         self.model_path = model_path
@@ -34,17 +54,209 @@ class LocalLLMMLX(LLM):
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
         self.image_token = getattr(self.processor, "image_token", "<|image|>")
         self.last_diagnostics: dict[str, Any] = {}
+        self.cache_trace_path = LOGS_DIR / "cache_trace.log"
 
-        # KV Prefix Cache state to prevent re-computing static system/history tokens across steps
-        self._cached_prefix_str: str = ""
-        self._cached_prefix_len_tokens: int = 0
-        self._cached_kv_objects: Any = None
+        self.apc_manager: Any = None
+        self.vision_cache: Any = None
+        self._static_prefix_prompt: str = ""
+        self._init_cache_trace_log()
+        self._init_caches()
+
+    def _init_cache_trace_log(self) -> None:
+        """Initializes logs/cache_trace.log to inspect what is cached and restored at every step."""
+        try:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"{'=' * 92}\n"
+                f"DYNAMIC KV CACHE & APC TRACE LOG (OVERWRITTEN AT SESSION START) — {ts}\n"
+                f"Model: {self.model_path}\n"
+                f"Purpose: Inspects exact token-level prefixes stored in and restored from KV Cache on each step.\n"
+                f"{'=' * 92}\n\n"
+            )
+            self.cache_trace_path.write_text(header, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _append_cache_trace(self, block: str) -> None:
+        """Appends a diagnostic cache inspection block to logs/cache_trace.log."""
+        try:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            with self.cache_trace_path.open("a", encoding="utf-8") as f:
+                f.write(block + "\n")
+                f.flush()
+        except Exception:
+            pass
+
+    def _record_step_cache_trace(
+        self,
+        step_label: str,
+        formatted_prompt: str,
+        use_apc: bool,
+        apc_reason: str,
+        has_images: bool,
+        prompt_tokens: int | None,
+        prompt_tps: float | None,
+        ttft_sec: float | None = None,
+    ) -> None:
+        """
+        Tokenizes the formatted prompt and logs the exact boundary between:
+        1. Tokens restored from the KV cache (0 .. matched_tokens - 1)
+        2. New suffix tokens prefilled by the GPU in this step (matched_tokens .. total_tokens)
+        """
+        try:
+            token_ids: list[int] = []
+            if hasattr(self.tokenizer, "encode"):
+                token_ids = list(self.tokenizer.encode(formatted_prompt, add_special_tokens=True))
+
+            total_tok = len(token_ids)
+            stats = self.apc_manager.stats_snapshot() if (self.apc_manager is not None and use_apc and not has_images) else {}
+            matched = int(stats.get("matched_tokens", 0)) if (use_apc and not has_images) else 0
+            restored = int(stats.get("restored_tokens", 0)) if (use_apc and not has_images) else 0
+            stored = int(stats.get("stored_tokens", 0)) if (use_apc and not has_images) else 0
+            hit_rate = float(stats.get("token_hit_rate", 0.0)) * 100.0 if (use_apc and not has_images) else 0.0
+
+            if has_images:
+                mode_str = f"VISION_STEP (APC Bypassed for SigLIP2 | VisionFeatureCache=Active) — {apc_reason}"
+            elif use_apc:
+                mode_str = f"APC_WARM_PREFIX_CACHE — {apc_reason}"
+            else:
+                mode_str = f"HIGH_PRECISION_CLEAN_PREFILL (APC Bypassed) — {apc_reason}"
+
+            first_5_tokens = [f"{tid}:{self._decode_single_token_debug(tid)}" for tid in token_ids[:5]]
+
+            if matched > 0 and matched <= total_tok and hasattr(self.tokenizer, "decode"):
+                cached_ids = token_ids[:matched]
+                suffix_ids = token_ids[matched:]
+                cached_text = self.tokenizer.decode(cached_ids, skip_special_tokens=False)
+                suffix_text = self.tokenizer.decode(suffix_ids, skip_special_tokens=False)
+                boundary_cached = [
+                    f"{tid}:{self._decode_single_token_debug(tid)}"
+                    for tid in cached_ids[max(0, len(cached_ids) - 4) :]
+                ]
+                boundary_suffix = [
+                    f"{tid}:{self._decode_single_token_debug(tid)}"
+                    for tid in suffix_ids[:4]
+                ]
+            else:
+                cached_ids = []
+                suffix_ids = token_ids
+                cached_text = "(0 tokens restored from KV cache — full prompt prefilled fresh on GPU)"
+                suffix_text = formatted_prompt
+                boundary_cached = []
+                boundary_suffix = [f"{tid}:{self._decode_single_token_debug(tid)}" for tid in token_ids[:4]]
+
+            ttft_str = f"{ttft_sec:.2f}s" if ttft_sec is not None else "n/a"
+            tps_str = f"{prompt_tps:.1f} tok/s" if prompt_tps else "n/a"
+
+            block = (
+                f"{'-' * 92}\n"
+                f"[{datetime.now().strftime('%H:%M:%S')}] {step_label}\n"
+                f"{'-' * 92}\n"
+                f"• CACHE MODE       : {mode_str}\n"
+                f"• TOKEN METRICS    : total_encoded={total_tok} (mlx_reported={prompt_tokens}) | "
+                f"restored_from_cache={len(cached_ids)} tok | newly_prefilled_on_gpu={len(suffix_ids)} tok\n"
+                f"• APC STATS        : matched={matched} | restored={restored} | newly_stored={stored} | "
+                f"hit_rate={hit_rate:.1f}% | prefill_tps={tps_str} | TTFT={ttft_str}\n"
+                f"• FIRST 5 TOKENS   : {first_5_tokens} (Verifies single <bos> ID 2 at index 0)\n"
+                f"• BOUNDARY TOKENS  : last_cached={boundary_cached}  -->  first_new_suffix={boundary_suffix}\n\n"
+                f"1. [RESTORED FROM KV CACHE ({len(cached_ids)} tokens)]:\n"
+                f"   --- HEAD (first 250 chars) ---\n"
+                f"   {repr(cached_text[:250])}\n"
+                f"   --- TAIL (last 350 chars of cached prefix) ---\n"
+                f"   {repr(cached_text[-350:]) if len(cached_text) > 250 else '(same as head)'}\n\n"
+                f"2. [NEWLY PREFILLED SUFFIX SENT TO GPU ({len(suffix_ids)} tokens)]:\n"
+                f"   --- HEAD (first 350 chars of new suffix) ---\n"
+                f"   {repr(suffix_text[:350])}\n"
+                f"   --- TAIL (last 350 chars of new suffix) ---\n"
+                f"   {repr(suffix_text[-350:]) if len(suffix_text) > 350 else '(same as head)'}\n"
+            )
+            self._append_cache_trace(block)
+        except Exception as exc:
+            self._append_cache_trace(f"[CACHE TRACE ERROR on {step_label}]: {exc}")
+
+    def _init_caches(self) -> None:
+        """Initializes in-memory MLX-VLM Automatic Prefix Caching (APC) and VisionFeatureCache."""
+        if APCManager is not None:
+            try:
+                self.apc_manager = APCManager(
+                    num_blocks=4096,
+                    block_size=16,
+                    disk=None,
+                )
+            except Exception:
+                self.apc_manager = None
+
+        if VisionFeatureCache is not None:
+            try:
+                self.vision_cache = VisionFeatureCache()
+            except Exception:
+                self.vision_cache = None
+
+    def warmup_static_prefix(self, static_system_prefix: str) -> None:
+        """
+        Pre-computes and pins the invariant System Prefix (base_prompt + core_profile + tools_prompt)
+        into APC warm memory at Turn 0 without duplicating <bos>.
+        """
+        if not static_system_prefix or self.apc_manager is None:
+            return
+        self._static_prefix_prompt = static_system_prefix
+        try:
+            seed_prompt = f"<|turn>system\n{static_system_prefix.strip()}\n\n--- ACTIVE SKILL: "
+            self.apc_manager.reset_stats()
+            t0 = datetime.now()
+            p_toks = None
+            p_tps = None
+            for chunk in stream_generate(
+                model=self.model,
+                processor=self.processor,
+                prompt=seed_prompt,
+                max_tokens=1,
+                temperature=0.0,
+                prefill_step_size=self.PREFILL_STEP_SIZE,
+                apc_manager=self.apc_manager,
+            ):
+                if p_toks is None and hasattr(chunk, "prompt_tokens"):
+                    p_toks = getattr(chunk, "prompt_tokens", None)
+                if hasattr(chunk, "prompt_tps") and getattr(chunk, "prompt_tps", None):
+                    p_tps = getattr(chunk, "prompt_tps", None)
+            elapsed = (datetime.now() - t0).total_seconds()
+            self._record_step_cache_trace(
+                step_label="TURN 0 — STATIC SYSTEM PREFIX WARMUP (base_prompt + core_profile + tools_prompt)",
+                formatted_prompt=seed_prompt,
+                use_apc=True,
+                apc_reason="Pinning invariant system prefix into APC warm RAM at session startup",
+                has_images=False,
+                prompt_tokens=p_toks,
+                prompt_tps=p_tps,
+                ttft_sec=elapsed,
+            )
+            self._clear_gpu_cache()
+        except Exception:
+            pass
+
+    def rewarm_static_prefix(self) -> None:
+        """Re-pins the Turn-0 static prefix if it was evicted."""
+        if self._static_prefix_prompt:
+            self.warmup_static_prefix(self._static_prefix_prompt)
 
     def clear_prefix_cache(self) -> None:
-        """Clears the persistent KV prefix cache upon session reset ('clear')."""
-        self._cached_prefix_str = ""
-        self._cached_prefix_len_tokens = 0
-        self._cached_kv_objects = None
+        """Closes and resets the APC manager, cache_trace.log, and re-warms the static Turn-0 prefix."""
+        if self.apc_manager is not None:
+            try:
+                self.apc_manager.close()
+            except Exception:
+                pass
+            self.apc_manager = None
+        if self.vision_cache is not None and hasattr(self.vision_cache, "clear"):
+            try:
+                self.vision_cache.clear()
+            except Exception:
+                pass
+        self._init_cache_trace_log()
+        self._init_caches()
+        if self._static_prefix_prompt:
+            self.warmup_static_prefix(self._static_prefix_prompt)
         self._clear_gpu_cache()
 
     def get_special_tokens_summary(self) -> str:
@@ -100,25 +312,78 @@ class LocalLLMMLX(LLM):
         return "\n".join(lines)
 
     @staticmethod
-    def _prepare_pil_images(images: list[str | Path | Image.Image] | None) -> list[Image.Image]:
-        """Loads and converts images to 3-channel RGB to prevent Metal channel dimension mismatch."""
+    def _prepare_image_inputs(
+        images: list[str | Path | Image.Image] | None,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Validates images and ensures 3-channel RGB compatibility for Metal while returning
+        file path strings so MLX-VLM's VisionFeatureCache can key entries by path.
+        """
         if not images:
-            return []
+            return [], []
 
-        loaded_images: list[Image.Image] = []
-        for img_item in images:
-            if isinstance(img_item, (str, Path)):
-                p = Path(img_item).expanduser().resolve()
-                if p.exists() and p.is_file():
-                    try:
-                        with Image.open(p) as opened_img:
-                            loaded_images.append(opened_img.convert("RGB"))
-                    except Exception:
-                        pass
-            elif isinstance(img_item, Image.Image):
-                loaded_images.append(img_item.convert("RGB"))
+        prepared_paths: list[str] = []
+        dimensions: list[str] = []
+        tmp_dir = Path(tempfile.gettempdir()) / "personal_agent_rgb_cache"
 
-        return loaded_images
+        for idx, img_item in enumerate(images):
+            try:
+                if isinstance(img_item, (str, Path)):
+                    p = Path(img_item).expanduser().resolve()
+                    if not (p.exists() and p.is_file()):
+                        continue
+                    with Image.open(p) as opened_img:
+                        dimensions.append(f"{opened_img.width}x{opened_img.height}")
+                        if opened_img.mode == "RGB":
+                            prepared_paths.append(str(p))
+                        else:
+                            tmp_dir.mkdir(parents=True, exist_ok=True)
+                            rgb_path = tmp_dir / f"rgb_{p.stat().st_mtime_ns}_{p.stem}.png"
+                            if not rgb_path.exists():
+                                opened_img.convert("RGB").save(rgb_path, format="PNG")
+                            prepared_paths.append(str(rgb_path))
+                elif isinstance(img_item, Image.Image):
+                    dimensions.append(f"{img_item.width}x{img_item.height}")
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    rgb_path = tmp_dir / f"pil_input_{idx}.png"
+                    img_item.convert("RGB").save(rgb_path, format="PNG")
+                    prepared_paths.append(str(rgb_path))
+            except Exception:
+                pass
+
+        return prepared_paths, dimensions
+
+    def _format_apc_status(
+        self,
+        has_images: bool,
+        use_apc: bool = True,
+        apc_reason: str = "",
+        prompt_tokens: int | None = None,
+        prompt_tps: float | None = None,
+    ) -> str:
+        """Formats APC and VisionFeatureCache telemetry for session_trace.log."""
+        tps_info = f" | prompt_tokens={prompt_tokens} | prompt_tps={prompt_tps:.1f} tok/s" if prompt_tokens and prompt_tps else ""
+        reason_info = f" [{apc_reason}]" if apc_reason else ""
+        if has_images:
+            v_status = "enabled" if self.vision_cache is not None else "unavailable"
+            return f"vision_step (APC bypassed for SigLIP2, VisionFeatureCache={v_status}){reason_info}{tps_info}"
+        if not use_apc:
+            return f"HIGH_PRECISION_CLEAN_PREFILL (APC bypassed){reason_info}{tps_info}"
+        if self.apc_manager is None:
+            return f"APC unavailable (upgrade to mlx-vlm>=0.7.10){tps_info}"
+        try:
+            stats = self.apc_manager.stats_snapshot()
+            matched = stats.get("matched_tokens", 0)
+            restored = stats.get("restored_tokens", 0)
+            stored = stats.get("stored_tokens", 0)
+            hit_rate = float(stats.get("token_hit_rate", 0.0)) * 100.0
+            disk_hits = stats.get("disk_hits", 0)
+            return (
+                f"APC active | matched={matched} tok | restored={restored} tok | "
+                f"stored={stored} tok | hit_rate={hit_rate:.1f}% | disk_hits={disk_hits}{reason_info}{tps_info}"
+            )
+        except Exception as exc:
+            return f"APC error ({exc}){tps_info}"
 
     def _format_input(
         self,
@@ -126,8 +391,8 @@ class LocalLLMMLX(LLM):
         num_images: int = 0,
     ) -> tuple[str, str]:
         """
-        Formats conversation messages into Gemma 4 chat template format,
-        injecting visual tokens if images are present and ensuring strict role alternation.
+        Formats conversation messages into Gemma 4 chat template format, stripping any redundant
+        leading <bos> string so processor.tokenizer.encode(add_special_tokens=True) adds a single <bos>.
         """
         image_prefix = (f"{self.image_token}\n" * num_images) if num_images > 0 else ""
 
@@ -151,16 +416,15 @@ class LocalLLMMLX(LLM):
                 else:
                     normalized.append({"role": role, "content": content})
 
+            for m in normalized:
+                if self.image_token in m["content"] or "<|image|>" in m["content"]:
+                    m["content"] = m["content"].replace(self.image_token, "").replace("<|image|>", "")
+
             if num_images > 0:
-                has_image_token = any(
-                    self.image_token in m["content"] or "<|image|>" in m["content"] or "<image>" in m["content"]
-                    for m in normalized
-                )
-                if not has_image_token:
-                    for m in reversed(normalized):
-                        if m["role"] == "user":
-                            m["content"] = f"{image_prefix}{m['content']}"
-                            break
+                for m in reversed(normalized):
+                    if m["role"] == "user":
+                        m["content"] = f"{image_prefix}{m['content']}"
+                        break
 
             try:
                 rendered = self.tokenizer.apply_chat_template(
@@ -168,10 +432,13 @@ class LocalLLMMLX(LLM):
                     tokenize=False,
                     add_generation_prompt=True,
                 )
+                bos_str = getattr(self.tokenizer, "bos_token", "<bos>") or "<bos>"
+                if rendered.startswith(bos_str):
+                    rendered = rendered[len(bos_str) :]
                 mode_label = (
-                    f"tokenizer.apply_chat_template(system_enabled, images={num_images})"
+                    f"tokenizer.apply_chat_template(system_enabled, single_bos, images={num_images})"
                     if num_images > 0
-                    else "tokenizer.apply_chat_template(system_enabled)"
+                    else "tokenizer.apply_chat_template(system_enabled, single_bos)"
                 )
                 return rendered, mode_label
             except Exception as exc_primary:
@@ -188,6 +455,9 @@ class LocalLLMMLX(LLM):
                         tokenize=False,
                         add_generation_prompt=True,
                     )
+                    bos_str = getattr(self.tokenizer, "bos_token", "<bos>") or "<bos>"
+                    if rendered.startswith(bos_str):
+                        rendered = rendered[len(bos_str) :]
                     return rendered, f"tokenizer.apply_chat_template(fallback_user_only: {exc_primary})"
                 except Exception:
                     pass
@@ -197,10 +467,11 @@ class LocalLLMMLX(LLM):
             if isinstance(prompt_or_messages, str)
             else "\n\n".join(f"{m['role']}: {m['content']}" for m in prompt_or_messages)
         )
-        return (
-            apply_chat_template(self.processor, self.model.config, prompt_str, num_images=num_images),
-            "mlx_vlm.apply_chat_template",
-        )
+        rendered_fb = apply_chat_template(self.processor, self.model.config, prompt_str, num_images=num_images)
+        bos_str = getattr(self.tokenizer, "bos_token", "<bos>") or "<bos>"
+        if isinstance(rendered_fb, str) and rendered_fb.startswith(bos_str):
+            rendered_fb = rendered_fb[len(bos_str) :]
+        return rendered_fb, "mlx_vlm.apply_chat_template"
 
     def _clear_gpu_cache(self) -> None:
         try:
@@ -235,26 +506,38 @@ class LocalLLMMLX(LLM):
         prompt: str | list[dict[str, str]],
         images: list[str | Path | Image.Image] | None = None,
         max_tokens: int = 2048,
+        use_apc: bool = True,
+        apc_reason: str = "standard",
+        step_label: str = "GENERATE",
     ) -> str:
-        pil_images = self._prepare_pil_images(images)
-        formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
+        image_paths, image_dims = self._prepare_image_inputs(images)
+        formatted_prompt, template_method = self._format_input(prompt, num_images=len(image_paths))
 
         self.last_diagnostics = {
             "template_method": template_method,
             "formatted_prompt": formatted_prompt,
+            "kv_cache_status": "pending",
             "stop_reason": "generate_complete",
             "total_chunks": 0,
             "buffered_subword_chunks": 0,
             "buffered_tokens_sample": [],
             "raw_with_special_tokens": "",
             "token_id_trace": [],
-            "images_count": len(pil_images),
-            "images_dimensions": [f"{im.width}x{im.height}" for im in pil_images],
+            "images_count": len(image_paths),
+            "images_dimensions": image_dims,
         }
 
         extra_kwargs: dict[str, Any] = {}
-        if pil_images:
-            extra_kwargs["image"] = pil_images if len(pil_images) > 1 else pil_images[0]
+        if image_paths:
+            extra_kwargs["image"] = image_paths
+            if self.vision_cache is not None:
+                extra_kwargs["vision_cache"] = self.vision_cache
+        elif use_apc and self.apc_manager is not None:
+            try:
+                self.apc_manager.reset_stats()
+                extra_kwargs["apc_manager"] = self.apc_manager
+            except Exception:
+                pass
 
         try:
             result = generate(
@@ -263,9 +546,28 @@ class LocalLLMMLX(LLM):
                 prompt=formatted_prompt,
                 max_tokens=max_tokens,
                 temperature=0.0,
+                prefill_step_size=self.PREFILL_STEP_SIZE,
                 **extra_kwargs,
             )
             text = result.text if hasattr(result, "text") else str(result)
+            p_toks = getattr(result, "prompt_tokens", None)
+            p_tps = getattr(result, "prompt_tps", None)
+            self.last_diagnostics["kv_cache_status"] = self._format_apc_status(
+                has_images=bool(image_paths),
+                use_apc=use_apc,
+                apc_reason=apc_reason,
+                prompt_tokens=p_toks,
+                prompt_tps=p_tps,
+            )
+            self._record_step_cache_trace(
+                step_label=step_label,
+                formatted_prompt=formatted_prompt,
+                use_apc=use_apc,
+                apc_reason=apc_reason,
+                has_images=bool(image_paths),
+                prompt_tokens=p_toks,
+                prompt_tps=p_tps,
+            )
             self.last_diagnostics["raw_with_special_tokens"] = text
             for stop_tok in self.STOP_TOKENS:
                 if stop_tok in text:
@@ -280,9 +582,12 @@ class LocalLLMMLX(LLM):
         prompt: str | list[dict[str, str]],
         images: list[str | Path | Image.Image] | None = None,
         max_tokens: int = 2048,
+        use_apc: bool = True,
+        apc_reason: str = "standard",
+        step_label: str = "STREAM_STEP",
     ) -> Iterator[str]:
-        pil_images = self._prepare_pil_images(images)
-        formatted_prompt, template_method = self._format_input(prompt, num_images=len(pil_images))
+        image_paths, image_dims = self._prepare_image_inputs(images)
+        formatted_prompt, template_method = self._format_input(prompt, num_images=len(image_paths))
 
         pad_streak = 0
         buffered_subword_chunks = 0
@@ -292,23 +597,39 @@ class LocalLLMMLX(LLM):
         buffered_tokens_sample: list[str] = []
         yielded_pieces: list[str] = []
         stop_reason = "natural_eos_or_max_tokens"
+        prompt_tokens: int | None = None
+        prompt_tps: float | None = None
+        substantial_answer_started = False
+        accumulated_text = ""
 
         self.last_diagnostics = {
             "template_method": template_method,
             "formatted_prompt": formatted_prompt,
+            "kv_cache_status": "pending",
             "stop_reason": stop_reason,
             "total_chunks": 0,
             "buffered_subword_chunks": 0,
             "buffered_tokens_sample": [],
             "raw_with_special_tokens": "",
             "token_id_trace": [],
-            "images_count": len(pil_images),
-            "images_dimensions": [f"{im.width}x{im.height}" for im in pil_images],
+            "images_count": len(image_paths),
+            "images_dimensions": image_dims,
         }
 
         extra_kwargs: dict[str, Any] = {}
-        if pil_images:
-            extra_kwargs["image"] = pil_images if len(pil_images) > 1 else pil_images[0]
+        if image_paths:
+            extra_kwargs["image"] = image_paths
+            if self.vision_cache is not None:
+                extra_kwargs["vision_cache"] = self.vision_cache
+        elif use_apc and self.apc_manager is not None:
+            try:
+                self.apc_manager.reset_stats()
+                extra_kwargs["apc_manager"] = self.apc_manager
+            except Exception:
+                pass
+
+        t_stream_start = datetime.now()
+        t_first_tok_sec: float | None = None
 
         try:
             for chunk in stream_generate(
@@ -317,13 +638,28 @@ class LocalLLMMLX(LLM):
                 prompt=formatted_prompt,
                 max_tokens=max_tokens,
                 temperature=0.0,
+                prefill_step_size=self.PREFILL_STEP_SIZE,
                 **extra_kwargs,
             ):
                 total_chunks += 1
+                if t_first_tok_sec is None:
+                    t_first_tok_sec = (datetime.now() - t_stream_start).total_seconds()
+                if prompt_tokens is None and hasattr(chunk, "prompt_tokens"):
+                    prompt_tokens = getattr(chunk, "prompt_tokens", None)
+                if hasattr(chunk, "prompt_tps") and getattr(chunk, "prompt_tps", None):
+                    prompt_tps = getattr(chunk, "prompt_tps", None)
+
                 raw_tok = getattr(chunk, "token", None)
                 tok_id: int | None = None
                 if raw_tok is not None:
                     tok_id = int(raw_tok.item()) if hasattr(raw_tok, "item") else int(raw_tok)
+
+                    # Only trigger the late channel token firewall if a real thought block already
+                    # closed AND the model has already emitted substantial natural-language answer text (>80 chars)
+                    if substantial_answer_started and tok_id in {self.CHANNEL_OPEN_TOKEN_ID, self.CHANNEL_CLOSE_TOKEN_ID}:
+                        stop_reason = f"late_channel_token_firewall(id={tok_id})"
+                        break
+
                     generated_token_ids.append(tok_id)
                     recent_token_ids.append(tok_id)
                     if len(recent_token_ids) > 36:
@@ -341,7 +677,17 @@ class LocalLLMMLX(LLM):
                     else:
                         pad_streak = 0
 
+                # Rely natively on chunk.text for <|channel> (100) and <channel|> (101) since they are
+                # non-special tokens in Gemma 4 and are emitted in exact word-order by the BPE detokenizer
                 piece = chunk.text if hasattr(chunk, "text") else str(chunk)
+
+                if substantial_answer_started and "<channel|>" in piece:
+                    before_ch = piece.split("<channel|>", 1)[0]
+                    if before_ch:
+                        yielded_pieces.append(before_ch)
+                        yield before_ch
+                    stop_reason = "late_channel_string_firewall"
+                    break
 
                 if not piece:
                     buffered_subword_chunks += 1
@@ -362,6 +708,17 @@ class LocalLLMMLX(LLM):
                     stop_reason = f"stop_token:{matched_tok}"
                     break
 
+                accumulated_text += piece
+                if not substantial_answer_started and ("</thought>" in accumulated_text or "<channel|>" in accumulated_text):
+                    norm_acc = accumulated_text.replace("<channel|>", "</thought>")
+                    parts = norm_acc.split("</thought>")
+                    after_last_close = parts[-1].strip()
+                    if (
+                        len(after_last_close) >= 80
+                        and not after_last_close.startswith(("{", "<thought>", "<|channel>", "call:"))
+                    ):
+                        substantial_answer_started = True
+
                 yielded_pieces.append(piece)
                 yield piece
 
@@ -369,10 +726,10 @@ class LocalLLMMLX(LLM):
                     stop_reason = f"stop_token_id:{tok_id}"
                     break
 
-            if generated_token_ids and hasattr(self.tokenizer, "decode"):
+            if generated_token_ids and hasattr(self.tokenizer, "decode") and not stop_reason.startswith("late_channel"):
                 try:
                     full_clean = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-                    for stop_tok in self.STOP_TOKENS:
+                    for stop_tok in (*self.STOP_TOKENS, "<channel|>"):
                         if stop_tok in full_clean:
                             full_clean = full_clean.split(stop_tok, 1)[0]
                     already_emitted = "".join(yielded_pieces)
@@ -400,7 +757,27 @@ class LocalLLMMLX(LLM):
                 tail_ids = [f"{tid}:{self._decode_single_token_debug(tid)}" for tid in generated_token_ids[-30:]]
                 trace_items = head_ids + [f"... ({len(generated_token_ids) - 60} intermediate tokens) ..."] + tail_ids
 
+            apc_status_str = self._format_apc_status(
+                has_images=bool(image_paths),
+                use_apc=use_apc,
+                apc_reason=apc_reason,
+                prompt_tokens=prompt_tokens,
+                prompt_tps=prompt_tps,
+            )
+
+            self._record_step_cache_trace(
+                step_label=step_label,
+                formatted_prompt=formatted_prompt,
+                use_apc=use_apc,
+                apc_reason=apc_reason,
+                has_images=bool(image_paths),
+                prompt_tokens=prompt_tokens,
+                prompt_tps=prompt_tps,
+                ttft_sec=t_first_tok_sec,
+            )
+
             self.last_diagnostics.update({
+                "kv_cache_status": apc_status_str,
                 "stop_reason": stop_reason,
                 "total_chunks": total_chunks,
                 "buffered_subword_chunks": buffered_subword_chunks,

@@ -1,8 +1,8 @@
-"""Herramientas locales bajo el Principio de Responsabilidad Única (SRP) sin redundancia en salidas:
-- file_search: búsqueda específica de archivos (entry_type='file') o carpetas (entry_type='dir') con filtro de extensión.
-- dir_tree: exploración compacta con rutas relativas, resumen de subcarpetas densas y filtros (extension_filter, sub_dir).
-- file_grep: búsqueda de código/texto con extracción dinámica de funciones completas vía AST/llaves.
-- file_read: lectura de archivos (soporta rutas absolutas, relativas al proyecto o rangos start_line..end_line).
+"""Local read-only tools following the Single Responsibility Principle (SRP):
+- file_search: locates files (entry_type='file') or folders (entry_type='dir') with extension filtering.
+- dir_tree: compact directory tree exploration with relative paths, dense-folder summaries, and filters.
+- file_grep: internal code/text search with dynamic complete function extraction via AST/braces.
+- file_read: reads documents/code (supports absolute/relative paths and start_line..end_line), SVGs, and raster images.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def _get_search_roots() -> list[Path]:
 
 
 def _parse_extension_filter(ext_filter: str) -> set[str]:
-    """Convierte una cadena como '.js, .json, jsx' en {'.js', '.json', '.jsx'}."""
+    """Converts a string like '.js, .json, jsx' into {'.js', '.json', '.jsx'}."""
     if not ext_filter or not ext_filter.strip():
         return set()
     parts = [p.strip().lower() for p in re.split(r"[,;\s]+", ext_filter) if p.strip()]
@@ -119,7 +119,6 @@ def _find_entries_by_name(
     mode = entry_type.lower().strip() if entry_type else "all"
     exts = allowed_exts or set()
     want_dirs = mode in {"all", "dir", "directory", "folder"}
-    # Si el modelo pasa extension_filter (ej. '.png') incluso con entry_type='dir', incluir también archivos
     want_files = (mode in {"all", "file", "files"}) or bool(exts)
 
     exact_matches: list[tuple[str, Path]] = []
@@ -182,8 +181,8 @@ def _find_entries_by_name(
 
 def _resolve_flexible_path(raw_input: str, expect_dir: bool = False) -> tuple[Path | None, list[Path], str]:
     """
-    Resuelve rutas absolutas, rutas con ~, o rutas relativas a cualquiera de los directorios autorizados
-    o subproyectos (ej. 'portfolio-2.0-vite/data/projectsData.js' o 'data/projectsData.js').
+    Resolves absolute paths, ~ paths, or paths relative to authorized workspaces or subprojects,
+    tolerating '-' vs '_' differences in intermediate directory names.
     """
     cleaned = raw_input.strip().strip("'\"")
     p = Path(cleaned).expanduser()
@@ -198,20 +197,37 @@ def _resolve_flexible_path(raw_input: str, expect_dir: bool = False) -> tuple[Pa
 
     target_name = p.name or cleaned
     entry_mode = "dir" if expect_dir else "all"
-    found_entries = _find_entries_by_name(target_name, _get_search_roots(), max_results=8, entry_type=entry_mode)
+    found_entries = _find_entries_by_name(target_name, _get_search_roots(), max_results=12, entry_type=entry_mode)
 
-    norm_cleaned = _normalize(cleaned.lstrip("./"))
+    def _norm_sep(s: str) -> str:
+        return re.sub(r"[-_]+", "-", _normalize(s))
+
+    norm_cleaned = _norm_sep(cleaned.lstrip("./"))
     matching_suffix = [
         path_obj for _, path_obj in found_entries
-        if _normalize(str(path_obj)).endswith(norm_cleaned)
+        if _norm_sep(str(path_obj)).endswith(norm_cleaned)
     ]
     candidates = matching_suffix if matching_suffix else [path_obj for _, path_obj in found_entries]
-    exact_name = [c for c in candidates if _normalize(c.name) == _normalize(target_name)]
+    exact_name = [c for c in candidates if _norm_sep(c.name) == _norm_sep(target_name)]
     chosen = exact_name if exact_name else candidates
+
+    if len(chosen) > 1:
+        input_parts = [_norm_sep(part) for part in p.parts if part not in {"/", ".", "~"} and part != p.name]
+        if input_parts:
+            scored_cands: list[tuple[int, Path]] = []
+            for cand_path in chosen:
+                cand_norm_str = _norm_sep(str(cand_path.parent))
+                overlap = sum(1 for part in input_parts if part and part in cand_norm_str)
+                scored_cands.append((overlap, cand_path))
+            max_overlap = max((sc[0] for sc in scored_cands), default=0)
+            if max_overlap > 0:
+                best_cands = [cand_path for ov, cand_path in scored_cands if ov == max_overlap]
+                if len(best_cands) == 1:
+                    chosen = best_cands
 
     if len(chosen) == 1:
         resolved = chosen[0].resolve()
-        note = f"[Ruta resuelta automáticamente: {resolved}]\n"
+        note = f"[Auto-resolved path: {resolved}]\n"
         return resolved, [], note
     if len(chosen) > 1:
         return None, chosen, ""
@@ -226,40 +242,37 @@ def safe_dir_tree(
     max_entries: int = 80,
 ) -> str:
     """
-    Explora el árbol de un directorio usando rutas relativas limpias (sin repetir la ruta base en cada línea).
-    Soporta hasta profundidad 5 por defecto y limita la vista previa por subcarpeta (10 archivos) cuando se
-    explora un proyecto raíz para evitar que una sola carpeta de íconos oculte el resto de subdirectorios.
+    Lists the directory tree using clean relative paths. Orders specific named files before generic
+    numbered 'mystery_*' files so candidate inspection checks named files first.
     """
     try:
         target, multiples, auto_note = _resolve_flexible_path(dirpath, expect_dir=True)
         if multiples:
             opts = "\n".join(f"- {m}" for m in multiples)
-            return f"Se encontraron varios directorios para '{dirpath}':\n{opts}\nEspecifica cuál deseas explorar."
+            return f"Multiple directories matched '{dirpath}':\n{opts}\nPlease specify the desired path."
         if target is None or not target.exists():
-            return f"Error: El directorio '{dirpath}' no existe."
+            return f"Error: Directory '{dirpath}' does not exist."
 
         if sub_dir and sub_dir.strip():
             sub_target = (target / sub_dir.strip().strip("/")).resolve()
             if not sub_target.exists():
-                return f"Error: La subcarpeta '{sub_dir}' no existe dentro de '{target}'."
+                return f"Error: Subfolder '{sub_dir}' does not exist inside '{target}'."
             target = sub_target
 
         if not _is_path_allowed(target):
-            return f"Error de seguridad: Acceso denegado fuera de directorios autorizados ('{target}')."
+            return f"Security Error: Access denied outside authorized workspaces ('{target}')."
         if not target.is_dir():
-            return f"Error: '{target}' es un archivo, no un directorio. Usa `file_read` para leerlo."
+            return f"Error: '{target}' is a file, not a directory. Use `file_read` to inspect it."
 
         exts = _parse_extension_filter(extension_filter)
         depth_limit = max(1, min(int(max_depth or 5), 6))
-        filter_info = f" | Filtro: {sorted(exts)}" if exts else ""
+        filter_info = f" | Filter: {sorted(exts)}" if exts else ""
         lines = [
-            f"{auto_note}[Directorio Base: {target}{filter_info}]",
-            "(Rutas relativas al Directorio Base — puedes pasar `'nombre_carpeta/archivo'` o la ruta completa a `file_read`):",
+            f"{auto_note}[Base Directory: {target}{filter_info}]",
+            "(Paths relative to Base Directory — pass `'subfolder/filename'` or the full path to `file_read`):",
         ]
 
         count = 0
-        # Si se explora la raíz de un proyecto (sin sub_dir específico), mostrar máximo 10 archivos por carpeta
-        # para que carpetas con decenas de SVGs (como public/assets/icons) nunca oculten otras subcarpetas.
         per_folder_preview = 60 if (sub_dir and sub_dir.strip()) else 10
 
         for root, dirs, files in os.walk(target, followlinks=False):
@@ -271,7 +284,12 @@ def safe_dir_tree(
                 continue
 
             visible_files = []
-            for f in sorted(files):
+            # Sort specific semantic filenames first, generic 'mystery_*' / numbered filenames second
+            sorted_files = sorted(
+                files,
+                key=lambda fname: (1 if fname.lower().startswith("mystery") else 0, fname.lower()),
+            )
+            for f in sorted_files:
                 if f.startswith("."):
                     continue
                 if exts and Path(f).suffix.lower() not in exts:
@@ -290,41 +308,54 @@ def safe_dir_tree(
                 lines.append(f"{indent}  📄 {rel_file}")
                 count += 1
                 if count >= max_entries:
-                    lines.append(f"{indent}  ... [Límite de {max_entries} entradas alcanzado. Usa `sub_dir` o `extension_filter` para inspeccionar una sección específica]")
+                    lines.append(f"{indent}  ... [Reached {max_entries} entries limit. Use `sub_dir` or `extension_filter` to inspect a specific section]")
                     return "\n".join(lines)
 
             if hidden_in_folder:
-                ext_counts = Counter(Path(f).suffix.lower() or "sin_ext" for f in hidden_in_folder)
+                ext_counts = Counter(Path(f).suffix.lower() or "no_ext" for f in hidden_in_folder)
                 ext_summary = ", ".join(f"{k} ({v})" for k, v in ext_counts.most_common(4))
                 folder_label = rel_dir.as_posix() if depth > 0 else "."
                 lines.append(
-                    f"{indent}  ... (+{len(hidden_in_folder)} archivos adicionales en '{folder_label}': {ext_summary} "
-                    f"— usa sub_dir=\"{folder_label}\" para listarlos todos)"
+                    f"{indent}  ... (+{len(hidden_in_folder)} additional files in '{folder_label}': {ext_summary} "
+                    f"— use sub_dir=\"{folder_label}\" to list all)"
                 )
 
         if count == 0:
             if exts:
-                lines.append(f"  (No se encontraron archivos con las extensiones {sorted(exts)} en este directorio)")
+                lines.append(f"  (No files matching extensions {sorted(exts)} found in this directory)")
             else:
-                lines.append("  (Directorio vacío)")
+                lines.append("  (Empty directory)")
         return "\n".join(lines)
 
     except Exception as exc:
-        return f"Error al explorar el directorio '{dirpath}': {exc}"
+        return f"Error exploring directory '{dirpath}': {exc}"
 
 
 def _read_pdf(path: Path, max_chars: int) -> str:
     reader = PdfReader(str(path))
     pages_text = []
+    first_page_key_lines: list[str] = []
     total_len = 0
     for i, page in enumerate(reader.pages):
         text = _sanitize_text(page.extract_text() or "")
-        pages_text.append(f"--- Página {i + 1} (de {len(reader.pages)}) ---\n{text}")
+        if i == 0:
+            non_empty = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            first_page_key_lines = non_empty[:8]
+        pages_text.append(f"--- Page {i + 1} (of {len(reader.pages)}) ---\n{text}")
         total_len += len(text)
         if total_len >= max_chars:
             break
-    full_text = "\n\n".join(pages_text)
-    return full_text[:max_chars]
+    full_text = "\n\n".join(pages_text)[:max_chars]
+
+    # Append a concise header recap at the bottom of the PDF output so Gemma 4's 512-token
+    # sliding-window attention layers always retain the exact top identifiers (e.g. Matrikelnummer & dates)
+    if first_page_key_lines:
+        recap_block = (
+            "\n\n[Key Document Header & Identifiers Recap (from Top of Page 1)]:\n"
+            + "\n".join(f"• {ln}" for ln in first_page_key_lines)
+        )
+        full_text += recap_block
+    return full_text
 
 
 def _read_docx(path: Path, max_chars: int) -> str:
@@ -334,7 +365,7 @@ def _read_docx(path: Path, max_chars: int) -> str:
 
 
 def _inspect_image(path: Path) -> str:
-    """Extrae metadatos técnicos completos e incrusta el marcador de ruta para inferencia visual."""
+    """Extracts complete technical metadata and embeds the visual pipeline path marker."""
     with Image.open(path) as img:
         width, height = img.size
         img_format = (img.format or path.suffix.upper().replace(".", "")).upper()
@@ -344,19 +375,20 @@ def _inspect_image(path: Path) -> str:
         resolved_path = str(path.resolve())
 
         return (
-            f"[Image File inspected]\n"
+            f"[Image File Inspected]\n"
             f"- Format: {img_format} | Color Space / Mode: {mode}\n"
             f"- Dimensions: {width}x{height} px (Aspect Ratio: {aspect}:1)\n"
             f"- File Size: {size_kb:.1f} KB\n"
             f"- Absolute Path: {resolved_path}\n"
             f"[IMAGE_READY_FOR_VISUALIZATION: {resolved_path}]\n"
-            f"Note: The visual data of this image are loaded in the multimodal pipeline. "
-            f"It describes its visual details as well as its technical specifications."
+            f"Note: The raw pixels of this image are now attached directly to your visual input. "
+            f"Inspect the attached image visually right now to describe the scene/UI, read any text or "
+            f"secret code written inside the pixels, and verify whether the visual content matches the filename."
         )
 
 
 def _inspect_svg(path: Path) -> str:
-    """Extrae metadatos técnicos y etiquetas vectoriales de un archivo XML SVG (sin pipeline raster CV)."""
+    """Extracts XML vector metadata and embedded text labels from an SVG file."""
     tree = ET.parse(path)
     root = tree.getroot()
     width = root.attrib.get("width", "unspecified")
@@ -395,42 +427,39 @@ def safe_read_file(
     end_line: int | None = None,
     max_chars: int = 20_000,
 ) -> str:
-    """
-    Lee el contenido de un archivo aceptando rutas absolutas o relativas.
-    Calibrado en 20.000 caracteres (~5.000 tokens, <90 MB de KV Cache en M4 16GB).
-    """
+    """Reads file contents supporting absolute or relative paths and optional line ranges."""
     try:
         raw_clean = filepath.strip().strip("'\"")
         if Path(raw_clean).name.startswith("."):
-            return f"Error de seguridad: Acceso denegado a elemento oculto ('{raw_clean}')."
+            return f"Security Error: Access denied to hidden item ('{raw_clean}')."
 
         target, multiples, auto_discovered_note = _resolve_flexible_path(raw_clean, expect_dir=False)
         if multiples:
             paths_str = "\n".join(f"- {p}" for p in multiples)
             return (
-                f"Se encontraron varios archivos que coinciden con '{filepath}':\n{paths_str}\n"
-                "Por favor invoca `file_read` indicando la ruta completa deseada."
+                f"Multiple files matched '{filepath}':\n{paths_str}\n"
+                "Please call `file_read` specifying the full path you want to read."
             )
 
         if target is None or not target.exists():
-            return f"Error: El archivo '{filepath}' no fue encontrado en los directorios autorizados."
+            return f"Error: File '{filepath}' was not found in authorized workspaces."
 
         if not _is_path_allowed(target):
-            return f"Error de seguridad: Acceso denegado fuera de directorios autorizados ('{filepath}')."
+            return f"Security Error: Access denied outside authorized workspaces ('{filepath}')."
 
         target_name_lower = target.name.lower()
         if any(blocked in target_name_lower for blocked in BLOCKED_PATTERNS):
-            return f"Error de seguridad: Acceso denegado a elemento protegido ('{target.name}')."
+            return f"Security Error: Access denied to protected item ('{target.name}')."
 
         if target.is_dir():
             return (
-                f"[Nota: '{target.name}' es un directorio; mostrando su estructura con `dir_tree`]\n"
+                f"[Note: '{target.name}' is a directory; listing its structure via `dir_tree`]\n"
                 + safe_dir_tree(str(target))
             )
 
         suffix = target.suffix.lower()
         if suffix in BLOCKED_EXTENSIONS:
-            return f"Error de seguridad: Acceso denegado a claves o certificados ('{suffix}')."
+            return f"Security Error: Access denied to certificate or key file ('{suffix}')."
 
         if suffix == ".pdf":
             content = _read_pdf(target, max_chars)
@@ -448,11 +477,11 @@ def safe_read_file(
                 s_idx = max(1, int(start_line or 1))
                 e_idx = min(total_lines, int(end_line or (s_idx + 200)))
                 sliced = [
-                    f"Línea {i:4d} | {all_lines[i - 1]}"
+                    f"Line {i:4d} | {all_lines[i - 1]}"
                     for i in range(s_idx, e_idx + 1)
                 ]
                 content = (
-                    f"[Mostrando líneas {s_idx} a {e_idx} de {total_lines} totales]\n"
+                    f"[Showing lines {s_idx} to {e_idx} of {total_lines} total]\n"
                     + "\n".join(sliced)
                 )
             else:
@@ -463,15 +492,15 @@ def safe_read_file(
                 lines_shown = clipped_part.count("\n") + 1
                 content = (
                     clipped_part
-                    + f"\n... [Archivo truncado en línea {lines_shown} de {total_lines} totales ({max_chars} de {len(content)} caracteres). "
-                    f"Usa `start_line={lines_shown + 1}` y `end_line={total_lines}` en `file_read` para leer los elementos restantes]."
+                    + f"\n... [File truncated at line {lines_shown} of {total_lines} total ({max_chars} of {len(content)} chars). "
+                    f"Use `start_line={lines_shown + 1}` and `end_line={total_lines}` in `file_read` to read the remaining lines]."
                 )
 
-        header = f"[Archivo leído: {target}]\n"
+        header = f"[File read: {target}]\n"
         return auto_discovered_note + header + content
 
     except Exception as exc:
-        return f"Error al leer '{filepath}': {exc}"
+        return f"Error reading '{filepath}': {exc}"
 
 
 def safe_search_files(
@@ -481,14 +510,11 @@ def safe_search_files(
     search_dir: str = "",
     max_results: int = 20,
 ) -> str:
-    """
-    Localiza archivos ([FILE]) y/o directorios ([DIR]) por nombre (exacto o difuso),
-    permitiendo filtrar por tipo de entrada ('dir', 'file', 'all') y extensión.
-    """
+    """Locates files ([FILE]) and/or directories ([DIR]) by exact or fuzzy name."""
     try:
         base_path = Path(search_dir).expanduser().resolve() if search_dir else None
         if base_path and not _is_path_allowed(base_path):
-            return f"Error de seguridad: El directorio '{search_dir}' no está permitido."
+            return f"Security Error: Directory '{search_dir}' is not permitted."
 
         exts = _parse_extension_filter(extension_filter)
         targets = [base_path] if (base_path and base_path.exists()) else _get_search_roots()
@@ -511,18 +537,18 @@ def safe_search_files(
             )
 
         if matches:
-            res = [f"Elementos encontrados ({len(matches)}):"]
+            res = [f"Found items ({len(matches)}):"]
             for kind, p in matches:
                 res.append(f"- [{kind}] {p}")
             return "\n".join(res)
 
         return (
-            f"No se encontraron elementos para pattern='{pattern}' (entry_type='{entry_type}', extension_filter='{extension_filter}'). "
-            "Intenta con una palabra clave más general o cambia los filtros."
+            f"No items found for pattern='{pattern}' (entry_type='{entry_type}', extension_filter='{extension_filter}'). "
+            "Try a broader single keyword or adjust the filters."
         )
 
     except Exception as exc:
-        return f"Error al buscar archivos: {exc}"
+        return f"Error searching files: {exc}"
 
 
 def _extract_python_ast_bounds(source_text: str, target_line_1based: int) -> tuple[int, int] | None:
@@ -601,7 +627,7 @@ def safe_grep_text(
     try:
         base_path = Path(search_dir).expanduser().resolve() if search_dir else None
         if base_path and not _is_path_allowed(base_path):
-            return f"Error de seguridad: El directorio '{search_dir}' no está autorizado."
+            return f"Security Error: Directory '{search_dir}' is not authorized."
 
         targets = [base_path] if (base_path and base_path.exists()) else _get_search_roots()
         def_findings: list[str] = []
@@ -611,7 +637,7 @@ def safe_grep_text(
         ctx_window = max(3, min(int(context_lines or 12), 80))
 
         if not norm_query:
-            return "Error: La consulta de búsqueda (query) está vacía."
+            return "Error: Search query is empty."
 
         for root_dir in targets:
             for root, dirs, files in os.walk(root_dir, followlinks=False):
@@ -640,13 +666,19 @@ def safe_grep_text(
                                     lines, idx, raw_content, suffix, ctx_window
                                 )
 
-                                tag = f"[DEFINICIÓN COMPLETA: líneas {start_c + 1} a {end_c}]" if is_definition else "[REFERENCIA]"
+                                tag = f"[COMPLETE DEFINITION: lines {start_c + 1} to {end_c}]" if is_definition else "[REFERENCE]"
                                 block_lines = [
-                                    f"Archivo: {file_path} | Coincidencia exacta en LÍNEA {line_num} {tag}:"
+                                    f"File: {file_path} | Exact match on LINE {line_num} {tag}:"
                                 ]
                                 for c_idx in range(start_c, end_c):
                                     code_line = lines[c_idx][:200]
-                                    block_lines.append(f"Línea {c_idx + 1:4d} | {code_line}")
+                                    block_lines.append(f"Line {c_idx + 1:4d} | {code_line}")
+
+                                if is_definition:
+                                    block_lines.append(
+                                        f"[AST Definition Bounds Recap: File={file_path} | "
+                                        f"Exact Definition Line={start_c + 1} (complete range: lines {start_c + 1} to {end_c})]"
+                                    )
 
                                 block_str = "\n".join(block_lines)
                                 if is_definition:
@@ -661,13 +693,13 @@ def safe_grep_text(
 
         combined = def_findings[:max_matches] if def_findings else other_findings[:max_matches]
         if not combined:
-            return f"No se encontraron coincidencias para '{query}' en los archivos."
+            return f"No matches found for '{query}' across files."
 
-        header = f"Coincidencias encontradas ({len(combined)} bloques):"
+        header = f"Found matches ({len(combined)} blocks):"
         return header + "\n\n" + "\n\n".join(combined)
 
     except Exception as exc:
-        return f"Error al buscar texto en archivos: {exc}"
+        return f"Error searching text inside files: {exc}"
 
 
 TOOL_METADATA: dict[str, dict[str, Any]] = {
@@ -680,7 +712,7 @@ TOOL_METADATA: dict[str, dict[str, Any]] = {
         "parameters": {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Single keyword or filename pattern (e.g., 'portfolio', 'StudentAngemeldetePruefung*.pdf')."},
+                "pattern": {"type": "string", "description": "Single keyword or filename pattern (e.g., 'portfolio', 'Immatrikulationsbescheinigung')."},
                 "entry_type": {"type": "string", "enum": ["all", "dir", "file"], "description": "Filter by 'dir' (folders only), 'file' (files only), or 'all'."},
                 "extension_filter": {"type": "string", "description": "Optional extension filter (e.g., '.pdf', '.js,.jsx')."},
             },
@@ -706,8 +738,8 @@ TOOL_METADATA: dict[str, dict[str, Any]] = {
     "file_grep": {
         "function": safe_grep_text,
         "description": (
-            "Searches INSIDE files for code, function definitions (e.g. '_clean_final_answer'), variables, or phrases. "
-            "Dynamically extracts the complete function body via AST and returns the exact file path and line number."
+            "Searches INSIDE files for code, function definitions (e.g. '_compose_modular_skill'), variables, or phrases. "
+            "Dynamically extracts the complete function body via AST and returns the exact file path and line numbers."
         ),
         "parameters": {
             "type": "object",

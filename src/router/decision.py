@@ -60,10 +60,12 @@ class RoutingDecision:
         probabilities: dict[str, float] = {}
         for field_name, answer in answers.items():
             if isinstance(answer, dict):
-                if isinstance(answer.get("confidence"), (int, float)):
-                    probabilities[field_name] = float(answer["confidence"])
-                elif "noul" in answer:
-                    probabilities[field_name] = float(answer["noul"])
+                if "choice" in answer and isinstance(answer.get("confidence"), (int, float)):
+                    probabilities[field_name] = round(float(answer["confidence"]), 4)
+                elif "noul" in answer or isinstance(answer.get("probabilities"), dict):
+                    probabilities[field_name] = round(probability_yes(field_name), 4)
+                elif isinstance(answer.get("confidence"), (int, float)):
+                    probabilities[field_name] = round(float(answer["confidence"]), 4)
 
         chosen_skill = choice("skill", "personal_assistant")
         skill_conf = float(probabilities.get("skill", 0.0))
